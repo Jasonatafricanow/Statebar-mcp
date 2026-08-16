@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dsh-user-state"
+version = "0.1.0"
+description = "Hermes User State Layer: a lightweight, continuously updated short-term state layer for AI agents (MCP stdio + REST)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "dsh-user-state contributors" }]
+keywords = ["mcp", "agent", "memory", "user-state", "context"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+# Core is deliberately dependency-free (stdlib only).
+# The MCP stdio transport speaks the MCP JSON-RPC protocol directly and is
+# verified against the official `mcp` SDK; it is NOT required at runtime.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+mcp = ["mcp>=1.2"]  # optional: used by integration tests / SDK-based clients
+
+[project.scripts]
+dsh-user-state = "dsh_user_state.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["dsh_user_state*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-p no:langsmith -p no:cacheprovider"
