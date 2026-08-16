@@ -3,7 +3,7 @@
 The extractor model is a deployment config item (派单总纲 §8): nothing here
 binds a concrete model. Recognized environment variables:
 
-    DSH_USER_STATE_DB            SQLite path (default: ~/.dsh-user-state/user_state.db)
+    DSH_USER_STATE_DB            SQLite path (default: ~/.statebar-mcp/user_state.db)
     DSH_USER_STATE_LLM_BASE_URL  OpenAI-compatible base URL (persistent extractor)
     DSH_USER_STATE_LLM_API_KEY   API key
     DSH_USER_STATE_LLM_MODEL     model name
@@ -25,7 +25,7 @@ def default_home() -> Path:
     env = os.environ.get("DSH_USER_STATE_HOME")
     if env:
         return Path(env)
-    return Path.home() / ".dsh-user-state"
+    return Path.home() / ".statebar-mcp"
 
 
 def default_db_path() -> Path:

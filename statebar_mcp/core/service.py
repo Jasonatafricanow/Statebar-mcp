@@ -212,7 +212,7 @@ class UserStateService:
     def healthcheck(self) -> Dict:
         return {
             "status": "ok",
-            "service": "dsh-user-state",
+            "service": "statebar-mcp",
             "version": __version__,
             "counts": self.store.counts(),
             "fast_extractor": self.fast_extractor.name,

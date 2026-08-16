@@ -22,21 +22,21 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from dsh_user_state.config import Config, ExtractorConfig  # noqa: E402
-from dsh_user_state.core.extractor.persistent import (  # noqa: E402
+from statebar_mcp.config import Config, ExtractorConfig  # noqa: E402
+from statebar_mcp.core.extractor.persistent import (  # noqa: E402
     MockExtractor,
     PersistentExtractor,
 )
-from dsh_user_state.core.models import (  # noqa: E402
+from statebar_mcp.core.models import (  # noqa: E402
     Observation,
     ObserveRequest,
     Source,
     SourceType,
     StateStatus,
 )
-from dsh_user_state.core.service import UserStateService  # noqa: E402
-from dsh_user_state.core.store import SQLiteStore  # noqa: E402
-from dsh_user_state.transports.rest import create_server  # noqa: E402
+from statebar_mcp.core.service import UserStateService  # noqa: E402
+from statebar_mcp.core.store import SQLiteStore  # noqa: E402
+from statebar_mcp.transports.rest import create_server  # noqa: E402
 
 LOCAL_TZ = datetime.now().astimezone().tzinfo
 

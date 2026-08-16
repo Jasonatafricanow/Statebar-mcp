@@ -1,4 +1,4 @@
-"""CLI: ``dsh-user-state mcp`` / ``dsh-user-state serve`` (派单总纲 §5)."""
+"""CLI: ``statebar-mcp mcp`` / ``statebar-mcp serve`` (派单总纲 §5)."""
 
 from __future__ import annotations
 
@@ -8,12 +8,12 @@ import sys
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
-        prog="dsh-user-state",
+        prog="statebar-mcp",
         description="Hermes User State Layer — short-term user state for AI agents.",
     )
     parser.add_argument(
         "--db", default=None,
-        help="SQLite path (default: ~/.dsh-user-state/user_state.db)",
+        help="SQLite path (default: ~/.statebar-mcp/user_state.db)",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 

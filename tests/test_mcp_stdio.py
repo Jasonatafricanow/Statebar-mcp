@@ -31,7 +31,7 @@ def spawn_server(db_path):
         DSH_USER_STATE_LLM_MOCK="1",
     )
     proc = subprocess.Popen(
-        [PYTHON, "-m", "dsh_user_state", "mcp"],
+        [PYTHON, "-m", "statebar_mcp", "mcp"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -66,7 +66,7 @@ def proc(tmp_path):
     p = spawn_server(tmp_path / "test.db")
     try:
         result = rpc_call(p, "initialize", {"protocolVersion": "2024-11-05"})
-        assert result["result"]["serverInfo"]["name"] == "dsh-user-state"
+        assert result["result"]["serverInfo"]["name"] == "statebar-mcp"
         yield p
     finally:
         p.stdin.close()
@@ -155,7 +155,7 @@ class TestMCPOfficialSDKInterop:
 
             params = StdioServerParameters(
                 command=PYTHON,
-                args=["-m", "dsh_user_state", "mcp"],
+                args=["-m", "statebar_mcp", "mcp"],
                 env={
                     **os.environ,
                     "PYTHONPATH": "",

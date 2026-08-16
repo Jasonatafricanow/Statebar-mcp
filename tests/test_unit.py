@@ -13,9 +13,9 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from dsh_user_state.core.extractor.fast_overlay import FastOverlayExtractor  # noqa: E402
-from dsh_user_state.core.lifecycle import lazy_expire, semantic_window  # noqa: E402
-from dsh_user_state.core.models import (  # noqa: E402
+from statebar_mcp.core.extractor.fast_overlay import FastOverlayExtractor  # noqa: E402
+from statebar_mcp.core.lifecycle import lazy_expire, semantic_window  # noqa: E402
+from statebar_mcp.core.models import (  # noqa: E402
     Certainty,
     Observation,
     Source,
@@ -24,10 +24,10 @@ from dsh_user_state.core.models import (  # noqa: E402
     StateStatus,
     TimeExpr,
 )
-from dsh_user_state.core.reconciler import Reconciler  # noqa: E402
-from dsh_user_state.core.service import UserStateService  # noqa: E402
-from dsh_user_state.core.snapshot import SnapshotBuilder  # noqa: E402
-from dsh_user_state.core.store import SQLiteStore  # noqa: E402
+from statebar_mcp.core.reconciler import Reconciler  # noqa: E402
+from statebar_mcp.core.service import UserStateService  # noqa: E402
+from statebar_mcp.core.snapshot import SnapshotBuilder  # noqa: E402
+from statebar_mcp.core.store import SQLiteStore  # noqa: E402
 
 LOCAL_TZ = datetime.now().astimezone().tzinfo
 

@@ -3,13 +3,13 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "dsh-user-state"
+name = "statebar-mcp"
 version = "0.1.0"
 description = "Hermes User State Layer: a lightweight, continuously updated short-term state layer for AI agents (MCP stdio + REST)."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-authors = [{ name = "dsh-user-state contributors" }]
+authors = [{ name = "statebar-mcp contributors" }]
 keywords = ["mcp", "agent", "memory", "user-state", "context"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -28,10 +28,10 @@ dev = ["pytest>=8"]
 mcp = ["mcp>=1.2"]  # optional: used by integration tests / SDK-based clients
 
 [project.scripts]
-dsh-user-state = "dsh_user_state.cli:main"
+statebar-mcp = "statebar_mcp.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["dsh_user_state*"]
+include = ["statebar_mcp*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

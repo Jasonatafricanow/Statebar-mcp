@@ -1,4 +1,4 @@
-# dsh-user-state
+# statebar-mcp
 
 **Hermes User State Layer** —— AI Agent 的外置短期工作记忆：轻量、持续更新、跨平台共享的**用户状态层**。
 
@@ -83,13 +83,13 @@ Agent：好，那改天                        ← 显式取消
 ## 快速开始
 
 ```bash
-pip install dsh-user-state
+pip install statebar-mcp
 
 # ① MCP stdio（默认分发，无 daemon，Client 拉起即用）
-dsh-user-state mcp
+statebar-mcp mcp
 
 # ② REST 常驻服务（多端共享：Hermes Adapter + 心潮 + Health + Diary）
-dsh-user-state serve --host 127.0.0.1 --port 8765
+statebar-mcp serve --host 127.0.0.1 --port 8765
 ```
 
 **零依赖**：core 全部 stdlib（sqlite3/json/threading/urllib）；MCP stdio 直接实现
@@ -102,7 +102,7 @@ MCP JSON-RPC 协议（已通过官方 `mcp` SDK 客户端互操作测试，测�
 {
   "mcpServers": {
     "user-state": {
-      "command": "dsh-user-state",
+      "command": "statebar-mcp",
       "args": ["mcp"]
     }
   }
@@ -145,7 +145,7 @@ CURRENT USER STATE
 ## 架构
 
 ```
-dsh_user_state/
+statebar_mcp/
 ├── core/                    ← Transport-neutral，应用层 Contract 冻结
 │   ├── extractor/           Fast Overlay（规则，同步）+ Persistent（LLM Structured，异步）
 │   ├── reconciler.py        R1-R10 + S1-S2（冻结规则集）
@@ -156,7 +156,7 @@ dsh_user_state/
 ├── transports/
 │   ├── mcp_stdio.py         默认分发（零依赖 JSON-RPC）
 │   └── rest.py              serve 模式
-└── cli.py                   dsh-user-state mcp | serve | health
+└── cli.py                   statebar-mcp mcp | serve | health
 ```
 
 ### 冻结语义速览
@@ -176,11 +176,11 @@ dsh_user_state/
 
 ## 配置
 
-环境变量（也可写 `~/.dsh-user-state/config.json`）：
+环境变量（也可写 `~/.statebar-mcp/config.json`）：
 
 | 变量 | 说明 |
 |---|---|
-| `DSH_USER_STATE_DB` | SQLite 路径（默认 `~/.dsh-user-state/user_state.db`） |
+| `DSH_USER_STATE_DB` | SQLite 路径（默认 `~/.statebar-mcp/user_state.db`） |
 | `DSH_USER_STATE_LLM_BASE_URL` | Persistent 抽取器 OpenAI 兼容端点 |
 | `DSH_USER_STATE_LLM_API_KEY` | API key |
 | `DSH_USER_STATE_LLM_MODEL` | 模型名（部署配置项，架构不绑定模型） |

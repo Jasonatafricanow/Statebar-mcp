@@ -1,4 +1,4 @@
-"""MCP stdio transport (``dsh-user-state mcp``) — the default distribution.
+"""MCP stdio transport (``statebar-mcp mcp``) — the default distribution.
 
 Zero-dependency implementation of the MCP stdio transport: newline-delimited
 JSON-RPC 2.0 over stdin/stdout. This is the protocol the MCP spec defines for
@@ -22,7 +22,7 @@ from .contract import TOOLS, Contract, ContractError
 logger = logging.getLogger(__name__)
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "dsh-user-state", "version": "0.1.0"}
+SERVER_INFO = {"name": "statebar-mcp", "version": "0.1.0"}
 
 _CAPABILITIES = {"tools": {"listChanged": False}}
 
@@ -46,7 +46,7 @@ class MCPStdioServer:
 
     def _log(self, message: str) -> None:
         # stdout is reserved for protocol frames; diagnostics go to stderr.
-        print(f"[dsh-user-state mcp] {message}", file=self._stderr, flush=True)
+        print(f"[statebar-mcp mcp] {message}", file=self._stderr, flush=True)
 
     def handle_request(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Return a response dict for requests, None for notifications."""

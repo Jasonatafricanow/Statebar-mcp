@@ -1,4 +1,4 @@
-"""REST transport (``dsh-user-state serve``).
+"""REST transport (``statebar-mcp serve``).
 
 Stdlib-only HTTP server exposing the frozen Contract:
 
@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 class _Handler(BaseHTTPRequestHandler):
-    server_version = "dsh-user-state/0.1"
+    server_version = "statebar-mcp/0.1"
     contract: Contract = None  # set by factory
 
     def log_message(self, fmt, *args):  # quieter
@@ -108,7 +108,7 @@ def create_server(
 
 def run_server(service: UserStateService, host: str = "127.0.0.1", port: int = 8765) -> None:
     server = create_server(service, host, port)
-    logger.info("dsh-user-state REST serving on http://%s:%d", host, port)
+    logger.info("statebar-mcp REST serving on http://%s:%d", host, port)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -1,18 +1,18 @@
-# DEV_LOG — dsh-user-state
+# DEV_LOG — statebar-mcp
 
 > 现场开发日志（详细复盘归知识库）。派单来源：`C:\知识库\项目\AI项目\对话状态栏计划V1-派单总纲v1.md`（v1.1，唯一准绳）。
 
 ## 2026-08-16 · 派单 A 主体完成（D1-D12 全通过）
 
 ### 上线记录（同日）
-- 生产 serve 常驻：`C:\Python314\python.exe -m dsh_user_state serve --port 8765 --log-file ...`（PID 10520）
-- 生产配置 `~/.dsh-user-state/config.json`：DB=`profiles/xiyue/state/user_state.db`；
+- 生产 serve 常驻：`C:\Python314\python.exe -m statebar_mcp serve --port 8765 --log-file ...`（PID 10520）
+- 生产配置 `~/.statebar-mcp/config.json`：DB=`profiles/xiyue/state/user_state.db`；
   抽取器=Gemini OpenAI 兼容端点（gemini-3.1-flash-lite）
 - 真实 LLM 抽取实测：'下午可能去写书法' → tentative plan + afternoon 窗口 ✓
 - 派单 B 上线后：serve 收到溪月网关真实 observe 流量，awake 状态入生产库 ✓
 
 ### 完成内容
-- 仓库骨架：`pyproject.toml`（零依赖 core；`[dev]`=pytest、`[mcp]`=官方 SDK 仅测试用）、`dsh_user_state/` 包、`tests/`
+- 仓库骨架：`pyproject.toml`（零依赖 core；`[dev]`=pytest、`[mcp]`=官方 SDK 仅测试用）、`statebar_mcp/` 包、`tests/`
 - `core/`：
   - `models.py`：Observation/Source/State/StateTransition/Snapshot 数据模型；`last_observed_at`（语义时间）字段
   - `store.py`：SQLite 四表（ingested_events/observations/states/state_transitions），两级幂等，WAL，线程安全
@@ -24,7 +24,7 @@
   - `snapshot.py`：BASE≤8 + query 增量≤3，最近终态（cancelled/completed/resolved）在 relevant_until 内短暂保留
   - `service.py`：observe 同步路径（幂等→Overlay→Reconciler→commit）+ 异步路径（后台线程，失败不影响同步 → D3）
 - `transports/`：`contract.py`（五 API 冻结映射）+ `mcp_stdio.py`（零依赖 JSON-RPC，stdout 只走协议帧）+ `rest.py`（stdlib HTTP）
-- `cli.py`：`dsh-user-state mcp | serve | health`
+- `cli.py`：`statebar-mcp mcp | serve | health`
 - 验收：**D1–D12 全部通过**（`tests/test_acceptance_d.py`，13 用例）；全套 62 passed
   - D1-D4 走真实 REST 传输；D5-D12 服务层 + 可控时钟 + mock 抽取器
   - MCP stdio 通过官方 `mcp` SDK 2.0 ClientSession 互操作测试

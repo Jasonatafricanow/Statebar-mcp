@@ -15,9 +15,9 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from dsh_user_state.core.service import UserStateService  # noqa: E402
-from dsh_user_state.core.store import SQLiteStore  # noqa: E402
-from dsh_user_state.transports.rest import create_server  # noqa: E402
+from statebar_mcp.core.service import UserStateService  # noqa: E402
+from statebar_mcp.core.store import SQLiteStore  # noqa: E402
+from statebar_mcp.transports.rest import create_server  # noqa: E402
 
 
 @pytest.fixture()
@@ -82,13 +82,13 @@ class TestCLI:
 
         env = {**os.environ, "PYTHONPATH": "", "DSH_USER_STATE_DB": str(tmp_path / "cli.db")}
         out = subprocess.run(
-            [sys.executable, "-m", "dsh_user_state", "health"],
+            [sys.executable, "-m", "statebar_mcp", "health"],
             capture_output=True, text=True, env=env, cwd=str(ROOT), timeout=30,
         )
         assert out.returncode == 0, out.stderr
         payload = json.loads(out.stdout)
         assert payload["status"] == "ok"
-        assert payload["service"] == "dsh-user-state"
+        assert payload["service"] == "statebar-mcp"
 
     def test_cli_serve_and_observe(self, tmp_path):
         import os
@@ -104,7 +104,7 @@ class TestCLI:
             "DSH_USER_STATE_DB": str(tmp_path / "serve.db"),
         }
         proc = subprocess.Popen(
-            [sys.executable, "-m", "dsh_user_state", "serve", "--port", str(port)],
+            [sys.executable, "-m", "statebar_mcp", "serve", "--port", str(port)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             env=env, cwd=str(ROOT),
         )
