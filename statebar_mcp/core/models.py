@@ -230,6 +230,10 @@ class State:
     # Out-of-order guards compare against THIS (D12), never against
     # internal processing time — equal-second bursts must not be rejected.
     last_observed_at: datetime = field(default_factory=utc_now)
+    # Identity of the observation that last changed this state
+    # ("<event_id>:<observation_index>"). Replaying the SAME observation is
+    # a no-op (crash-recovery idempotency) — never duplicate transitions.
+    last_observation_key: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -248,6 +252,7 @@ class State:
             "created_at": dt_to_iso(self.created_at),
             "updated_at": dt_to_iso(self.updated_at),
             "last_observed_at": dt_to_iso(self.last_observed_at),
+            "last_observation_key": self.last_observation_key,
         }
 
     @classmethod
@@ -268,6 +273,7 @@ class State:
             created_at=parse_dt(data.get("created_at") or utc_now().isoformat()),
             updated_at=parse_dt(data.get("updated_at") or utc_now().isoformat()),
             last_observed_at=parse_dt(data.get("last_observed_at") or utc_now().isoformat()),
+            last_observation_key=str(data.get("last_observation_key", "") or ""),
         )
 
 

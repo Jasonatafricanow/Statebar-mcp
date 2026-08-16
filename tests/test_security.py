@@ -375,3 +375,77 @@ class TestWorkerLifecycle:
             assert store.get_unreconciled_observations("u", "e1") == []
         finally:
             service.close()
+
+    def test_replay_after_reconcile_before_mark_is_idempotent(self):
+        """The reviewer's minimal repro: legacy crash BETWEEN reconcile and
+        the reconciled mark. Replaying the same observation must NOT produce
+        duplicate transitions (1 → must stay 1)."""
+        store = SQLiteStore(":memory:")
+        service = UserStateService(store, persistent_extractor=MockExtractor())
+        now = datetime.now(timezone.utc)
+        req = ObserveRequest(
+            subject_id="u", event_id="e1", text="我刚睡醒",
+            source=Source(type="conversation"), observed_at=now,
+        )
+        try:
+            # simulate a crash of the OLD code path: ingest → insert obs →
+            # reconcile (state + transition committed) → crash before the
+            # reconciled=1 mark
+            store.try_ingest_event("u", "e1", now)
+            obs = service.fast_extractor.extract("u", "e1", req.text, req.source, now)
+            store.insert_observations(obs)
+            service._reconcile_all("u", obs)  # commits state + transition
+            awake = store.get_state("u", "sleep", "awake")
+            assert awake is not None
+            transitions_before = store.get_transitions(awake.state_id)
+            assert len(transitions_before) == 1  # reviewer repro: exactly 1
+
+            r = service.observe(req)  # recovery replay
+            assert r["status"] == "resumed"
+
+            # replay must be a no-op for state mutation
+            transitions_after = store.get_transitions(awake.state_id)
+            assert len(transitions_after) == 1, (
+                "replay duplicated transitions: %d -> %d"
+                % (len(transitions_before), len(transitions_after))
+            )
+            assert store.get_unreconciled_observations("u", "e1") == []
+        finally:
+            service.close()
+
+    def test_incomplete_body_401_is_bounded(self):
+        """P2: a client declaring Content-Length but sending nothing must
+        still receive the 401 within a bounded time — the reject-path drain
+        must not block forever."""
+        import socket as socket_mod
+
+        service = UserStateService(SQLiteStore(":memory:"))
+        srv = create_server(service, "127.0.0.1", 0, auth_token="sekrit")
+        port = srv.server_address[1]
+        thread = threading.Thread(target=srv.serve_forever, daemon=True)
+        thread.start()
+        try:
+            sock = socket_mod.create_connection(("127.0.0.1", port), timeout=5)
+            sock.settimeout(5)
+            # declare a 64 KiB body, then send NOTHING
+            sock.sendall(
+                b"POST /v1/observe HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: 65536\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+            t0 = time.monotonic()
+            data = b""
+            try:
+                while b"\r\n\r\n" not in data:
+                    data += sock.recv(4096)
+            finally:
+                sock.close()
+            elapsed = time.monotonic() - t0
+            assert b"401" in data.split(b"\r\n")[0], data[:80]
+            assert elapsed < 3.0, f"401 took {elapsed:.2f}s (unbounded drain)"
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            service.close()

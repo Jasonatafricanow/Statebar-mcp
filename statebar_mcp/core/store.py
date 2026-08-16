@@ -17,6 +17,7 @@ import json
 import logging
 import sqlite3
 import threading
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -73,21 +74,22 @@ CREATE INDEX IF NOT EXISTS idx_obs_subject_time
     ON observations (subject_id, observed_at);
 
 CREATE TABLE IF NOT EXISTS states (
-    state_id           TEXT PRIMARY KEY,
-    subject_id         TEXT NOT NULL,
-    category           TEXT NOT NULL DEFAULT '',
-    key                TEXT NOT NULL DEFAULT '',
-    value              TEXT NOT NULL DEFAULT '',
-    status             TEXT NOT NULL DEFAULT 'created',
-    certainty          TEXT NOT NULL DEFAULT 'confirmed',
-    valid_from         TEXT NOT NULL,
-    valid_until        TEXT NOT NULL,
-    relevant_until     TEXT NOT NULL,
-    followup_relevant  INTEGER NOT NULL DEFAULT 0,
-    snapshot_priority  INTEGER NOT NULL DEFAULT 0,
-    created_at         TEXT NOT NULL,
-    updated_at         TEXT NOT NULL,
-    last_observed_at   TEXT NOT NULL
+    state_id              TEXT PRIMARY KEY,
+    subject_id            TEXT NOT NULL,
+    category              TEXT NOT NULL DEFAULT '',
+    key                   TEXT NOT NULL DEFAULT '',
+    value                 TEXT NOT NULL DEFAULT '',
+    status                TEXT NOT NULL DEFAULT 'created',
+    certainty             TEXT NOT NULL DEFAULT 'confirmed',
+    valid_from            TEXT NOT NULL,
+    valid_until           TEXT NOT NULL,
+    relevant_until        TEXT NOT NULL,
+    followup_relevant     INTEGER NOT NULL DEFAULT 0,
+    snapshot_priority     INTEGER NOT NULL DEFAULT 0,
+    created_at            TEXT NOT NULL,
+    updated_at            TEXT NOT NULL,
+    last_observed_at      TEXT NOT NULL,
+    last_observation_key  TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_states_subject
@@ -121,6 +123,7 @@ class SQLiteStore:
         if self.db_path != ":memory:":
             Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._tx_depth = 0
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
@@ -144,6 +147,42 @@ class SQLiteStore:
             self._conn.execute(
                 "ALTER TABLE observations ADD COLUMN time_expression TEXT NOT NULL DEFAULT ''"
             )
+        state_cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(states)")}
+        if "last_observation_key" not in state_cols:
+            self._conn.execute(
+                "ALTER TABLE states ADD COLUMN last_observation_key TEXT NOT NULL DEFAULT ''"
+            )
+
+    # -- transactions -----------------------------------------------------------
+
+    def _commit_if_needed(self) -> None:
+        """Commit only when NOT inside an explicit transaction() block."""
+        if self._tx_depth == 0:
+            self._conn.commit()
+
+    @contextmanager
+    def transaction(self):
+        """One SQLite transaction: BEGIN IMMEDIATE ... COMMIT/ROLLBACK.
+
+        Nested calls are supported (depth counter). All mutating store
+        methods defer their commit while inside this block, so a group of
+        state writes + transitions + reconciled marks + event status becomes
+        atomic: a crash leaves either everything or nothing, and recovery
+        replay can never double-apply."""
+        with self._lock:
+            self._tx_depth += 1
+            try:
+                if self._tx_depth == 1:
+                    self._conn.execute("BEGIN IMMEDIATE")
+                yield
+                if self._tx_depth == 1:
+                    self._conn.commit()
+            except Exception:
+                if self._tx_depth == 1:
+                    self._conn.rollback()
+                raise
+            finally:
+                self._tx_depth -= 1
 
     def close(self) -> None:
         with self._lock:
@@ -167,7 +206,7 @@ class SQLiteStore:
                 "VALUES (?, ?, ?, ?, ?)",
                 (subject_id, event_id, _iso(observed_at), status, _iso(utc_now())),
             )
-            self._conn.commit()
+            self._commit_if_needed()
             return cur.rowcount > 0
 
     def get_event(self, subject_id: str, event_id: str) -> Optional[Dict[str, Any]]:
@@ -184,7 +223,7 @@ class SQLiteStore:
                 "UPDATE ingested_events SET status=? WHERE subject_id=? AND event_id=?",
                 (status, subject_id, event_id),
             )
-            self._conn.commit()
+            self._commit_if_needed()
 
     # -- observations (observation-level idempotency) ------------------------
 
@@ -225,7 +264,7 @@ class SQLiteStore:
                 # 1 = inserted, 0 = duplicate ignored.
                 if cur.rowcount > 0:
                     inserted.append(obs)
-            self._conn.commit()
+            self._commit_if_needed()
         return inserted
 
     def count_event_observations(self, subject_id: str, event_id: str) -> int:
@@ -262,7 +301,7 @@ class SQLiteStore:
                     "WHERE subject_id=? AND event_id=? AND observation_index=?",
                     (subject_id, event_id, obs.observation_index),
                 )
-            self._conn.commit()
+            self._commit_if_needed()
 
     def get_observations(self, subject_id: str, limit: int = 200) -> List[Observation]:
         with self._lock:
@@ -334,8 +373,9 @@ class SQLiteStore:
                 "INSERT OR REPLACE INTO states "
                 "(state_id, subject_id, category, key, value, status, certainty, "
                 " valid_from, valid_until, relevant_until, followup_relevant, "
-                " snapshot_priority, created_at, updated_at, last_observed_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " snapshot_priority, created_at, updated_at, last_observed_at, "
+                " last_observation_key) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     state.state_id,
                     state.subject_id,
@@ -352,9 +392,10 @@ class SQLiteStore:
                     _iso(state.created_at),
                     _iso(state.updated_at),
                     _iso(state.last_observed_at),
+                    state.last_observation_key,
                 ),
             )
-            self._conn.commit()
+            self._commit_if_needed()
 
     def record_transition(self, transition: StateTransition) -> None:
         with self._lock:
@@ -372,7 +413,7 @@ class SQLiteStore:
                     _iso(transition.created_at),
                 ),
             )
-            self._conn.commit()
+            self._commit_if_needed()
 
     def get_transitions(self, state_id: str) -> List[StateTransition]:
         with self._lock:

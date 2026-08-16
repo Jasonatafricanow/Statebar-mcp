@@ -158,10 +158,19 @@ def make_rec(clock):
     return Reconciler(store, now_fn=clock), store
 
 
+_OBS_SEQ = 0
+
+
 def obs(type_, key, value="", category="", certainty=Certainty.CONFIRMED,
         time_expr=TimeExpr.UNSPECIFIED, observed=None, source_type="conversation"):
+    # each observation is its own (event_id, observation_index) pair — in
+    # production the pair is UNIQUE, so the replay-idempotency key derived
+    # from it must be unique per observation here too
+    global _OBS_SEQ
+    _OBS_SEQ += 1
     return Observation(
-        subject_id="user-001", event_id="e", type=type_, category=category or type_,
+        subject_id="user-001", event_id=f"e{_OBS_SEQ}", type=type_,
+        category=category or type_,
         key=key, value=value, certainty=certainty, time_expression=time_expr,
         source=Source(type=source_type),
         observed_at=observed or datetime.now(timezone.utc),

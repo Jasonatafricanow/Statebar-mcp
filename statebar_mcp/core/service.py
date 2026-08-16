@@ -102,19 +102,20 @@ class UserStateService:
             resuming = True
 
         # ---- synchronous path: Fast Overlay → Reconciler → commit.
-        # The event row stays 'pending' until this has fully committed, so a
-        # crash here can be retried instead of being swallowed as duplicate.
-        # Crash-recovery: reconcile EVERY unreconciled observation of this
-        # event (persisted-but-not-yet-reconciled leftovers from a previous
-        # crashed attempt are replayed here), then mark them reconciled.
+        # The event row stays 'pending' until this fully commits, so a crash
+        # here can be retried instead of being swallowed as duplicate.
+        # ONE SQLite transaction: observation insert + state/transition
+        # writes + reconciled marks + event status commit atomically —
+        # recovery replay can never double-apply any part of it.
         sync_obs = self.fast_extractor.extract(
             subject_id, event_id, request.text, request.source, request.observed_at
         )
-        self.store.insert_observations(sync_obs)
-        unreconciled = self.store.get_unreconciled_observations(subject_id, event_id)
-        sync_applied = self._reconcile_all(subject_id, unreconciled)
-        self.store.mark_observations_reconciled(subject_id, event_id, unreconciled)
-        self.store.set_event_status(subject_id, event_id, "sync_committed")
+        with self.store.transaction():
+            self.store.insert_observations(sync_obs)
+            unreconciled = self.store.get_unreconciled_observations(subject_id, event_id)
+            sync_applied = self._reconcile_all(subject_id, unreconciled)
+            self.store.mark_observations_reconciled(subject_id, event_id, unreconciled)
+            self.store.set_event_status(subject_id, event_id, "sync_committed")
 
         result = {
             "status": "accepted" if not resuming else "resumed",
@@ -187,26 +188,27 @@ class UserStateService:
 
     def _process_async(self, request: ObserveRequest, start_index: int) -> None:
         subject_id, event_id = request.subject_id, request.event_id
-        status = "failed"
         try:
             observations = self.persistent_extractor.extract(request)
-            if observations:
-                for obs in observations:
-                    obs.observation_index = start_index + obs.observation_index
-                    obs.subject_id = subject_id
-                    obs.event_id = event_id
-                self.store.insert_observations(observations)
-            # reconcile EVERY unreconciled observation of the event (new ones
-            # plus leftovers from a previous crashed attempt)
-            unreconciled = self.store.get_unreconciled_observations(subject_id, event_id)
-            self._reconcile_all(subject_id, unreconciled)
-            self.store.mark_observations_reconciled(subject_id, event_id, unreconciled)
-            status = "complete"
+            with self.store.transaction():
+                if observations:
+                    for obs in observations:
+                        obs.observation_index = start_index + obs.observation_index
+                        obs.subject_id = subject_id
+                        obs.event_id = event_id
+                    self.store.insert_observations(observations)
+                # reconcile EVERY unreconciled observation of the event (new
+                # ones plus leftovers from a previous crashed attempt), then
+                # mark them reconciled — all in the SAME transaction as the
+                # state/transition writes and the final event status.
+                unreconciled = self.store.get_unreconciled_observations(subject_id, event_id)
+                self._reconcile_all(subject_id, unreconciled)
+                self.store.mark_observations_reconciled(subject_id, event_id, unreconciled)
+                self.store.set_event_status(subject_id, event_id, "complete")
         except Exception:  # D3: async failure never breaks the sync path
             logger.exception("persistent extraction failed for event %s", event_id)
-        finally:
             try:
-                self.store.set_event_status(subject_id, event_id, status)
+                self.store.set_event_status(subject_id, event_id, "failed")
             except Exception:  # store may already be closed during shutdown
                 logger.debug("could not persist final event status for %s", event_id)
 

@@ -22,6 +22,7 @@ from __future__ import annotations
 import hmac
 import json
 import logging
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional, Tuple
@@ -44,6 +45,21 @@ class _Handler(BaseHTTPRequestHandler):
     contract: Contract = None  # set by factory
     auth_token: str = ""        # set by factory; "" disables auth
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES
+    # Socket-level read timeout for this connection. Bounds EVERY blocking
+    # read (headers, bodies, drains) so slow/incomplete requests can never
+    # pin a handler thread forever.
+    request_timeout: float = 10.0
+    # How long the reject paths may spend draining an (in)complete body
+    # before responding. Keeps 401/413 latency bounded for slow-loris style
+    # clients that declare Content-Length without sending anything.
+    drain_timeout: float = 0.5
+
+    def setup(self) -> None:
+        super().setup()
+        try:
+            self.connection.settimeout(self.request_timeout)
+        except OSError:  # pragma: no cover
+            pass
 
     def log_message(self, fmt, *args):  # quieter
         logger.debug("http %s %s", self.address_string(), fmt % args)
@@ -69,18 +85,38 @@ class _Handler(BaseHTTPRequestHandler):
         return hmac.compare_digest(provided.strip(), self.auth_token)
 
     def _drain_request_body(self) -> None:
-        """Read and discard any unread request body (capped) so the socket
-        closes cleanly. On Windows, closing a keep-alive socket with unread
-        inbound data can send RST and abort the client's in-flight read of
-        our error response (WinError 10053)."""
+        """Bounded-time discard of any unread request body, so the socket can
+        close cleanly (on Windows an unread-body close can RST and abort the
+        client's read of our error response — WinError 10053) WITHOUT letting
+        a client that declares Content-Length but sends nothing pin this
+        thread forever: the drain gives up after ``drain_timeout`` seconds."""
         raw = self.headers.get("Content-Length") or "0"
         try:
             length = int(raw)
         except ValueError:
             return
-        if length > 0:
+        if length <= 0:
+            return
+        remaining = min(length, self.max_body_bytes)
+        deadline = time.monotonic() + self.drain_timeout
+        sock = self.connection
+        old_timeout = sock.gettimeout()
+        try:
+            # bound EACH read attempt to the drain budget: rfile.read(n)
+            # blocks until n bytes or EOF, so the socket timeout is what
+            # actually bounds a client that sends nothing.
+            sock.settimeout(self.drain_timeout)
+            while remaining > 0 and time.monotonic() < deadline:
+                try:
+                    chunk = self.rfile.read(min(65536, remaining))
+                except OSError:
+                    return
+                if not chunk:
+                    return
+                remaining -= len(chunk)
+        finally:
             try:
-                self.rfile.read(min(length, self.max_body_bytes))
+                sock.settimeout(old_timeout)
             except OSError:  # pragma: no cover
                 pass
 

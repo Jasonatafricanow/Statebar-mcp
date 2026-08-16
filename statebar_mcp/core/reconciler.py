@@ -70,16 +70,27 @@ class Reconciler:
             return None
         return max(matches, key=lambda s: s.updated_at)
 
+    @staticmethod
+    def _obs_key(obs: Optional[Observation]) -> str:
+        if obs is None:
+            return ""
+        return f"{obs.event_id}:{obs.observation_index}"
+
     def _is_stale_creation(self, obs: Observation, states: List[State], key: str) -> bool:
-        """D12: a delayed message must never create a state that would roll
-        back newer evidence for the same semantic key. Consults the store
-        (ALL statuses, including terminal), because a completed/cancelled
-        state is exactly what must not be rolled back."""
+        """D12 + crash-recovery idempotency for creation paths:
+        - a delayed message must never create a state that would roll back
+          newer evidence for the same semantic key;
+        - replaying the SAME observation (already applied) must not create a
+          duplicate state. Consults the store (ALL statuses, including
+          terminal), because a completed/cancelled state is exactly what
+          must not be rolled back."""
         if not key:
             return False
         latest = self.store.get_latest_state_by_key(obs.subject_id, key)
         if latest is None:
             return False
+        if latest.last_observation_key == self._obs_key(obs):
+            return True  # this exact observation already applied
         if latest.last_observed_at > obs.observed_at:
             logger.debug(
                 "stale creation skipped: obs observed_at %s older than state %s last_observed %s",
@@ -108,6 +119,7 @@ class Reconciler:
             created_at=now,
             updated_at=now,
             last_observed_at=obs.observed_at,
+            last_observation_key=self._obs_key(obs),
         )
 
     def _transition(self, state: State, to_status: str, reason: str,
@@ -143,7 +155,16 @@ class Reconciler:
     ) -> bool:
         """In-place update with transition history. Refuses when the
         observation is older than the state's last SEMANTIC change (D12
-        guard; equal-second bursts are fine — T10)."""
+        guard; equal-second bursts are fine — T10). Refuses when this exact
+        observation was already applied (crash-recovery replay idempotency:
+        no duplicate transitions)."""
+        obs_key = self._obs_key(obs)
+        if obs_key and state.last_observation_key == obs_key:
+            logger.debug(
+                "observation %s already applied to state %s; replay skipped",
+                obs_key, state.state_id,
+            )
+            return False
         if obs.observed_at < state.last_observed_at:
             logger.debug(
                 "stale observation %s (observed %s < state last_observed %s); skipped",
@@ -167,12 +188,17 @@ class Reconciler:
             state.followup_relevant = followup_relevant
         state.updated_at = self._now()
         state.last_observed_at = obs.observed_at
+        state.last_observation_key = obs_key
         self._apply(state, transition)
         return True
 
     def _supersede(self, state: State, obs: Optional[Observation], reason: str) -> bool:
         """Mark a state superseded. Refuses when the observation is older
-        than the state's last semantic change (D12: no rollbacks)."""
+        than the state's last semantic change (D12: no rollbacks) or when
+        this exact observation was already applied (replay idempotency)."""
+        obs_key = self._obs_key(obs)
+        if obs_key and state.last_observation_key == obs_key:
+            return False
         if obs is not None and obs.observed_at < state.last_observed_at:
             logger.debug(
                 "stale supersede skipped: obs %s < state last_observed %s",
@@ -183,6 +209,7 @@ class Reconciler:
         state.status = StateStatus.SUPERSEDED
         state.updated_at = self._now()
         state.last_observed_at = obs.observed_at if obs is not None else state.last_observed_at
+        state.last_observation_key = obs_key
         self._apply(state, transition)
         return True
 
