@@ -134,6 +134,19 @@ class TestFailClosedCLI:
         assert out.returncode == 2
         assert "refusing to bind" in (out.stderr + out.stdout)
 
+    def test_library_level_create_server_fail_closed(self):
+        """The fail-closed invariant is enforced by create_server itself —
+        a library caller cannot bypass it."""
+        service = UserStateService(SQLiteStore(":memory:"))
+        try:
+            with pytest.raises(ValueError, match="without an auth"):
+                create_server(service, "0.0.0.0", 0, auth_token="")
+            # with a token, non-loopback is allowed
+            srv = create_server(service, "0.0.0.0", 0, auth_token="t")
+            srv.server_close()
+        finally:
+            service.close()
+
 
 class TestPrivacyGate:
     def test_llm_backend_requires_explicit_enable(self):
@@ -255,36 +268,68 @@ class TestEventRecovery:
 class SlowExtractor(PersistentExtractor):
     name = "slow"
 
+    def __init__(self, delay=1.0, started=None):
+        self.delay = delay
+        self.started = started  # optional threading.Event set when extract begins
+
     def available(self):
         return True
 
     def extract(self, request):
-        time.sleep(1.0)
+        if self.started is not None:
+            self.started.set()
+        time.sleep(self.delay)
         return []
 
 
 class TestWorkerLifecycle:
-    def test_close_drains_and_joins_worker(self, tmp_path):
-        store = SQLiteStore(str(tmp_path / "drain.db"))
-        service = UserStateService(store, persistent_extractor=SlowExtractor())
+    def test_close_completes_inflight_then_closes_store(self, tmp_path):
+        """An in-flight task MUST finish before the store closes: close()
+        waits for it (bounded by the task's own duration)."""
+        started = threading.Event()
+        store = SQLiteStore(str(tmp_path / "inflight.db"))
+        service = UserStateService(store, persistent_extractor=SlowExtractor(1.0, started))
         now = datetime.now(timezone.utc)
         req = ObserveRequest(
             subject_id="u", event_id="e1", text="我刚睡醒",
             source=Source(type="conversation"), observed_at=now,
         )
-        service.observe(req)  # queues a 1s task
-        assert service._worker is not None
+        service.observe(req)
+        assert started.wait(2.0), "worker never started the task"
         worker = service._worker
         t0 = time.monotonic()
-        service.close()  # must drain the task and join the worker
+        service.close()
         elapsed = time.monotonic() - t0
-        assert elapsed >= 0.9, "close() did not wait for in-flight work"
+        assert elapsed >= 0.9, "close() returned before the in-flight task finished"
         assert not worker.is_alive()
-        # store was closed by service.close(); reopen the file to verify the
-        # drained task committed its final status before shutdown
-        check = SQLiteStore(str(tmp_path / "drain.db"))
+        check = SQLiteStore(str(tmp_path / "inflight.db"))
         try:
             assert check.get_event("u", "e1")["status"] == "complete"
+        finally:
+            check.close()
+
+    def test_close_drops_unstarted_work_cleanly(self, tmp_path):
+        """Queued-but-unstarted tasks are skipped at shutdown: no write races
+        after close, event stays recoverable (sync_committed)."""
+        started = threading.Event()
+        store = SQLiteStore(str(tmp_path / "drop.db"))
+        service = UserStateService(store, persistent_extractor=SlowExtractor(1.5, started))
+        now = datetime.now(timezone.utc)
+        e1 = ObserveRequest(subject_id="u", event_id="e1", text="我刚睡醒",
+                            source=Source(type="conversation"), observed_at=now)
+        e2 = ObserveRequest(subject_id="u", event_id="e2", text="我睡了",
+                            source=Source(type="conversation"), observed_at=now)
+        service.observe(e1)  # worker starts this (slow)
+        assert started.wait(2.0)
+        service.observe(e2)  # queued behind e1
+        worker = service._worker
+        service.close()  # e1 finishes in-flight; e2 skipped
+        assert not worker.is_alive()
+        check = SQLiteStore(str(tmp_path / "drop.db"))
+        try:
+            assert check.get_event("u", "e1")["status"] == "complete"
+            # e2 was never processed asynchronously but remains resumable
+            assert check.get_event("u", "e2")["status"] == "sync_committed"
         finally:
             check.close()
 
@@ -301,5 +346,32 @@ class TestWorkerLifecycle:
             )
             assert service._worker is None  # no thread for a disabled path
             assert store.get_event("u", "e1")["status"] == "complete"
+        finally:
+            service.close()
+
+    def test_crash_between_obs_insert_and_reconcile_recovers(self):
+        """Crash window: observation persisted but NOT yet reconciled. The
+        next observe of the event must replay it and build the state."""
+        store = SQLiteStore(":memory:")
+        service = UserStateService(store, persistent_extractor=MockExtractor())
+        now = datetime.now(timezone.utc)
+        req = ObserveRequest(
+            subject_id="u", event_id="e1", text="我刚睡醒",
+            source=Source(type="conversation"), observed_at=now,
+        )
+        try:
+            # simulate: previous attempt ingested the event and persisted the
+            # overlay observation, then crashed BEFORE reconciling it
+            store.try_ingest_event("u", "e1", now)
+            obs = service.fast_extractor.extract("u", "e1", req.text, req.source, now)
+            store.insert_observations(obs)  # committed, but reconciled=0
+            assert store.get_state("u", "sleep", "awake") is None
+
+            r = service.observe(req)
+            assert r["status"] == "resumed"
+            # the unreconciled leftover was replayed → state now exists
+            assert store.get_state("u", "sleep", "awake").status == "active"
+            # and it was marked reconciled → no double transitions later
+            assert store.get_unreconciled_observations("u", "e1") == []
         finally:
             service.close()

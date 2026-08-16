@@ -1,4 +1,4 @@
-"""State Reconciler 鈥?the frozen ruleset (娲惧崟鎬荤翰 搂10).
+"""State Reconciler — the frozen ruleset (派单总纲 §10).
 
 Business rules R1-R10, system rules S1-S2, plus the conservative principle
 and the out-of-order guard (semantic observed_at ordering, D12).
@@ -143,7 +143,7 @@ class Reconciler:
     ) -> bool:
         """In-place update with transition history. Refuses when the
         observation is older than the state's last SEMANTIC change (D12
-        guard; equal-second bursts are fine 鈥?T10)."""
+        guard; equal-second bursts are fine — T10)."""
         if obs.observed_at < state.last_observed_at:
             logger.debug(
                 "stale observation %s (observed %s < state last_observed %s); skipped",

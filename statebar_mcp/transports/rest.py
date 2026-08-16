@@ -34,6 +34,10 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_BODY_BYTES = 64 * 1024
 
 
+def _is_loopback(host: str) -> bool:
+    return host in ("127.0.0.1", "localhost", "::1")
+
+
 class _Handler(BaseHTTPRequestHandler):
     server_version = "statebar-mcp/0.1"
     protocol_version = "HTTP/1.1"
@@ -169,6 +173,14 @@ def create_server(
     auth_token: str = "",
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
 ) -> ThreadingHTTPServer:
+    # Fail-closed invariant lives HERE, not just in the CLI: any library
+    # caller binding a non-loopback address without a token must be refused.
+    if not _is_loopback(host) and not auth_token:
+        raise ValueError(
+            f"refusing to bind non-loopback host {host!r} without an auth "
+            "token: user state must not be exposed on the network "
+            "unauthenticated (set auth_token, or bind 127.0.0.1)"
+        )
     handler = type(
         "_ContractHandler",
         (_Handler,),

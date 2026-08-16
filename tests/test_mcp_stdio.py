@@ -30,6 +30,10 @@ def spawn_server(db_path):
         DSH_USER_STATE_DB=str(db_path),
         DSH_USER_STATE_LLM_MOCK="1",
     )
+    # Simulate the plain-Windows default (ANSI codepage stdio): the server
+    # must pin UTF-8 itself and must NOT depend on these convenience switches.
+    env.pop("PYTHONUTF8", None)
+    env.pop("PYTHONIOENCODING", None)
     proc = subprocess.Popen(
         [PYTHON, "-m", "statebar_mcp", "mcp"],
         stdin=subprocess.PIPE,
@@ -119,6 +123,44 @@ class TestMCPStdioRaw:
         )
         snap = json.loads(msg2["result"]["content"][0]["text"])
         assert "awake" in snap["text"]
+
+    def test_chinese_roundtrip_without_pythonutf8(self, proc):
+        """Windows default stdio is the ANSI codepage (GBK). The server must
+        pin UTF-8 on the pipe itself — this test runs WITHOUT PYTHONUTF8 /
+        PYTHONIOENCODING (stripped in spawn_server) and would fail if any
+        Chinese text were mangled at the protocol boundary."""
+        now = datetime.now(timezone.utc).isoformat()
+        msg = rpc_call(
+            proc,
+            "tools/call",
+            {
+                "name": "user_state.observe",
+                "arguments": {
+                    "subject_id": "cn-1",
+                    "event_id": "c1",
+                    "text": "胃有点疼",
+                    "observed_at": now,
+                    "source": {"type": "conversation", "platform": "cli"},
+                },
+            },
+        )
+        assert msg["result"]["isError"] is False
+        raw = msg["result"]["content"][0]["text"]
+        assert "\ufffd" not in raw  # no replacement chars on the wire
+        content = json.loads(raw)
+        types = [o["type"] for o in content["sync_observations"]]
+        assert "symptom" in types  # the GBK-mangled text could never match
+        assert any(o["key"] == "stomach_pain" for o in content["sync_observations"])
+
+        msg2 = rpc_call(
+            proc,
+            "tools/call",
+            {"name": "user_state.snapshot", "arguments": {"subject_id": "cn-1"}},
+        )
+        snap_raw = msg2["result"]["content"][0]["text"]
+        assert "\ufffd" not in snap_raw
+        snap = json.loads(snap_raw)
+        assert "stomach discomfort: active" in snap["text"]
 
     def test_unknown_tool_error(self, proc):
         msg = rpc_call(proc, "tools/call", {"name": "nope", "arguments": {}})

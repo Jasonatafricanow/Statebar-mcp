@@ -35,10 +35,24 @@ def _make_error(request_id: Any, code: int, message: str) -> Dict[str, Any]:
     return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
 
 
+def force_utf8_stdio() -> None:
+    """The MCP stdio wire format is UTF-8 newline-delimited JSON-RPC. On
+    Windows the standard streams default to the ANSI codepage (e.g. GBK), so
+    ANY Chinese text would be corrupted at the protocol boundary unless we
+    pin the encoding here. Must not depend on PYTHONUTF8/PYTHONIOENCODING."""
+    for stream in (sys.stdin, sys.stdout):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError, OSError):  # pragma: no cover
+            # non-rewritable stream (e.g. replaced by tests); leave as-is
+            pass
+
+
 class MCPStdioServer:
     """Synchronous JSON-RPC loop over stdin/stdout (no external deps)."""
 
     def __init__(self, service: UserStateService, stdin=None, stdout=None, stderr=None):
+        force_utf8_stdio()
         self.contract = Contract(service)
         self._stdin = stdin or sys.stdin
         self._stdout = stdout or sys.stdout

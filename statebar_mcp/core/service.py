@@ -104,11 +104,16 @@ class UserStateService:
         # ---- synchronous path: Fast Overlay → Reconciler → commit.
         # The event row stays 'pending' until this has fully committed, so a
         # crash here can be retried instead of being swallowed as duplicate.
+        # Crash-recovery: reconcile EVERY unreconciled observation of this
+        # event (persisted-but-not-yet-reconciled leftovers from a previous
+        # crashed attempt are replayed here), then mark them reconciled.
         sync_obs = self.fast_extractor.extract(
             subject_id, event_id, request.text, request.source, request.observed_at
         )
-        new_obs = self.store.insert_observations(sync_obs)
-        sync_applied = self._reconcile_all(subject_id, new_obs)
+        self.store.insert_observations(sync_obs)
+        unreconciled = self.store.get_unreconciled_observations(subject_id, event_id)
+        sync_applied = self._reconcile_all(subject_id, unreconciled)
+        self.store.mark_observations_reconciled(subject_id, event_id, unreconciled)
         self.store.set_event_status(subject_id, event_id, "sync_committed")
 
         result = {
@@ -168,11 +173,13 @@ class UserStateService:
             item = self._queue.get()
             if item is _SENTINEL:
                 return
-            # NOTE: tasks queued BEFORE close() are still processed (drain):
-            # close() joins this worker before closing the store, so these
-            # writes are always safe. New tasks cannot arrive after close
-            # (_ensure_worker refuses when closed).
             request, start_index = item
+            if self._closed.is_set():
+                # shutdown in progress: drop queued-but-unstarted work. Its
+                # event stays sync_committed and will resume on a later
+                # re-observe (in-flight set is cleared here).
+                self._unmark_in_flight(request.subject_id, request.event_id)
+                continue
             try:
                 self._process_async(request, start_index)
             finally:
@@ -188,8 +195,12 @@ class UserStateService:
                     obs.observation_index = start_index + obs.observation_index
                     obs.subject_id = subject_id
                     obs.event_id = event_id
-                new_obs = self.store.insert_observations(observations)
-                self._reconcile_all(subject_id, new_obs)
+                self.store.insert_observations(observations)
+            # reconcile EVERY unreconciled observation of the event (new ones
+            # plus leftovers from a previous crashed attempt)
+            unreconciled = self.store.get_unreconciled_observations(subject_id, event_id)
+            self._reconcile_all(subject_id, unreconciled)
+            self.store.mark_observations_reconciled(subject_id, event_id, unreconciled)
             status = "complete"
         except Exception:  # D3: async failure never breaks the sync path
             logger.exception("persistent extraction failed for event %s", event_id)
@@ -300,9 +311,11 @@ class UserStateService:
     # ------------------------------------------------------------------ lifecycle
 
     def close(self) -> None:
-        """Stop accepting work, drain queued async tasks, join the worker,
-        then close the extractor and the store (in that order, so no
-        background thread can ever write into a closed connection)."""
+        """Stop accepting work, skip queued-but-unstarted tasks, and make
+        sure the worker has fully EXITED before the extractor/store are
+        closed — an in-flight LLM request is bounded by the extractor's own
+        timeout, so this join is bounded too and no background thread can
+        ever write into a closed connection."""
         self._closed.set()
         try:
             self._queue.put_nowait(_SENTINEL)
@@ -310,6 +323,14 @@ class UserStateService:
             pass
         worker = self._worker
         if worker is not None and worker is not threading.current_thread():
-            worker.join(timeout=_WORKER_JOIN_TIMEOUT_S)
+            grace = getattr(self.persistent_extractor, "timeout", _WORKER_JOIN_TIMEOUT_S) + 5.0
+            worker.join(timeout=grace)
+            if worker.is_alive():
+                logger.warning(
+                    "persistent worker still busy after %.1fs; waiting for the "
+                    "in-flight extraction to finish (bounded by its own timeout)",
+                    grace,
+                )
+                worker.join()
         self.persistent_extractor.close()
         self.store.close()

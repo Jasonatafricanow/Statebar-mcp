@@ -60,10 +60,12 @@ CREATE TABLE IF NOT EXISTS observations (
     source_session_id  TEXT NOT NULL DEFAULT '',
     source_message_id  TEXT NOT NULL DEFAULT '',
     observed_at        TEXT NOT NULL,
+    time_expression    TEXT NOT NULL DEFAULT '',
     certainty          TEXT NOT NULL DEFAULT 'confirmed',
     confidence         REAL NOT NULL DEFAULT 1.0,
     raw_payload        TEXT NOT NULL DEFAULT '',
     created_at         TEXT NOT NULL,
+    reconciled         INTEGER NOT NULL DEFAULT 0,
     UNIQUE (subject_id, event_id, observation_index)
 );
 
@@ -123,7 +125,25 @@ class SQLiteStore:
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            self._migrate()
             self._conn.commit()
+
+    def _migrate(self) -> None:
+        """In-place upgrades for databases created by older versions."""
+        obs_cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(observations)")}
+        if "reconciled" not in obs_cols:
+            self._conn.execute(
+                "ALTER TABLE observations ADD COLUMN reconciled INTEGER NOT NULL DEFAULT 0"
+            )
+            # Only rows written by the pre-migration code path exist here;
+            # that path reconciled inline, so they are all done.
+            self._conn.execute("UPDATE observations SET reconciled=1")
+        if "time_expression" not in obs_cols:
+            # v0.1 dropped time_expression on persist; historical rows keep ''
+            # (treated as unspecified), new rows carry the real expression.
+            self._conn.execute(
+                "ALTER TABLE observations ADD COLUMN time_expression TEXT NOT NULL DEFAULT ''"
+            )
 
     def close(self) -> None:
         with self._lock:
@@ -179,8 +199,8 @@ class SQLiteStore:
                     "INSERT OR IGNORE INTO observations "
                     "(subject_id, event_id, observation_index, type, category, key, value, "
                     " source_type, source_platform, source_session_id, source_message_id, "
-                    " observed_at, certainty, confidence, raw_payload, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " observed_at, time_expression, certainty, confidence, raw_payload, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         obs.subject_id,
                         obs.event_id,
@@ -194,6 +214,7 @@ class SQLiteStore:
                         obs.source.session_id,
                         obs.source.message_id,
                         _iso(obs.observed_at),
+                        obs.time_expression,
                         obs.certainty,
                         obs.confidence,
                         obs.raw_payload,
@@ -215,6 +236,34 @@ class SQLiteStore:
             ).fetchone()
         return int(row[0])
 
+    # -- reconcile tracking (crash recovery) -----------------------------------
+
+    def get_unreconciled_observations(
+        self, subject_id: str, event_id: str
+    ) -> List[Observation]:
+        """Observations persisted but not yet reconciled — the crash window
+        between insert and reconcile. Replayed on the next observe of the
+        event, so no state is ever permanently lost."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM observations WHERE subject_id=? AND event_id=? "
+                "AND reconciled=0 ORDER BY observed_at, observation_index",
+                (subject_id, event_id),
+            ).fetchall()
+        return [self._obs_from_row(dict(r)) for r in rows]
+
+    def mark_observations_reconciled(
+        self, subject_id: str, event_id: str, observations: List[Observation]
+    ) -> None:
+        with self._lock:
+            for obs in observations:
+                self._conn.execute(
+                    "UPDATE observations SET reconciled=1 "
+                    "WHERE subject_id=? AND event_id=? AND observation_index=?",
+                    (subject_id, event_id, obs.observation_index),
+                )
+            self._conn.commit()
+
     def get_observations(self, subject_id: str, limit: int = 200) -> List[Observation]:
         with self._lock:
             rows = self._conn.execute(
@@ -234,6 +283,7 @@ class SQLiteStore:
             key=row["key"],
             value=row["value"],
             certainty=row["certainty"],
+            time_expression=row["time_expression"],
             source=Source(
                 type=row["source_type"],
                 platform=row["source_platform"],
