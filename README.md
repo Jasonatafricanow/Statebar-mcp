@@ -82,19 +82,40 @@ Agent：好，那改天                        ← 显式取消
 
 ## 快速开始
 
+> **发布状态**：PyPI 尚未发布。当前请从源码安装：
+
 ```bash
-pip install statebar-mcp
+git clone https://github.com/christopher931649/Statebar-mcp.git
+cd Statebar-mcp
+pip install .            # 或开发模式：pip install -e ".[dev,mcp]"
 
 # ① MCP stdio（默认分发，无 daemon，Client 拉起即用）
 statebar-mcp mcp
 
-# ② REST 常驻服务（多端共享：Hermes Adapter + 心潮 + Health + Diary）
+# ② REST 常驻服务（多端共享：Adapter + 心潮 + Health + Diary；默认只绑本机回环）
 statebar-mcp serve --host 127.0.0.1 --port 8765
 ```
+
+> `pip install statebar-mcp` 在首个 PyPI 版本（0.1.0）发布后生效。
 
 **零依赖**：core 全部 stdlib（sqlite3/json/threading/urllib）；MCP stdio 直接实现
 MCP JSON-RPC 协议（已通过官方 `mcp` SDK 客户端互操作测试，测试见
 `tests/test_mcp_stdio.py`）。
+
+### ⚠️ 隐私与数据边界（使用前必读）
+
+- **REST serve 默认只绑定 `127.0.0.1`，无认证。** 绑定非回环地址（如
+  `--host 0.0.0.0`）前必须先设置认证令牌 `DSH_USER_STATE_SERVE_TOKEN`——
+  服务会**拒绝**在无令牌时绑定非回环地址（fail-closed）。设置令牌后，
+  **所有**端点（含 `/v1/health`）都要求 `Authorization: Bearer <token>`。
+  请求体上限默认 64 KiB（`DSH_USER_STATE_MAX_BODY_BYTES`）。
+- **启用 LLM 抽取 = 同意把用户的原始消息文本发给第三方模型端点。**
+  发送内容仅限：抽取指令（系统提示词）+ 当条用户消息文本；**不会**发送
+  subject_id、event_id、助手回复、历史状态或数据库内容。该路径默认**关闭**，
+  必须显式设置 `DSH_USER_STATE_LLM_ENABLED=1` 且配置端点后才启用；
+  推荐使用本地 Ollama（`http://127.0.0.1:11434/v1`）等不出境的端点。
+  未启用时，规则路径（刚醒/睡了/取消/症状/吃药）照常工作，计划类抽取缺失。
+- 数据全部落在本地 SQLite（`~/.statebar-mcp/user_state.db`），不包含任何遥测。
 
 ### MCP config 示例（Claude / Codex / 任意 MCP Agent）
 
@@ -181,13 +202,16 @@ statebar_mcp/
 | 变量 | 说明 |
 |---|---|
 | `DSH_USER_STATE_DB` | SQLite 路径（默认 `~/.statebar-mcp/user_state.db`） |
-| `DSH_USER_STATE_LLM_BASE_URL` | Persistent 抽取器 OpenAI 兼容端点 |
+| `DSH_USER_STATE_LLM_ENABLED` | **显式开关**：`1`/`true` 才允许把用户消息文本发送给 LLM 端点（隐私边界，默认关闭） |
+| `DSH_USER_STATE_LLM_BASE_URL` | Persistent 抽取器 OpenAI 兼容端点（推荐本地 Ollama） |
 | `DSH_USER_STATE_LLM_API_KEY` | API key |
 | `DSH_USER_STATE_LLM_MODEL` | 模型名（部署配置项，架构不绑定模型） |
-| `DSH_USER_STATE_LLM_MOCK=1` | 使用确定性 mock 抽取器（离线开发/CI） |
-| `DSH_USER_STATE_SERVE_HOST/PORT` | serve 绑定地址（默认 127.0.0.1:8765） |
+| `DSH_USER_STATE_LLM_MOCK=1` | 使用确定性 mock 抽取器（本地、无网络出口；离线开发/CI） |
+| `DSH_USER_STATE_SERVE_HOST/PORT` | serve 绑定地址（默认 127.0.0.1:8765；非回环必须配 token） |
+| `DSH_USER_STATE_SERVE_TOKEN` | Bearer 令牌；设置后所有端点（含 health）强制认证 |
+| `DSH_USER_STATE_MAX_BODY_BYTES` | 请求体上限（默认 65536） |
 
-未配置 LLM 时：同步 Fast Overlay 路径照常工作（刚醒/睡了/取消/症状/好多了/吃药），
+未启用/未配置 LLM 时：同步 Fast Overlay 路径照常工作（刚醒/睡了/取消/症状/好多了/吃药），
 Persistent 异步路径优雅禁用。
 
 ## 深度接入：确定性 Adapter（推荐给框架开发者）
@@ -202,17 +226,19 @@ prefetch(current_user_message)
   3. 注入 Context
 ```
 
-Hermes 侧参考实现：`C:\projects\hermes-user-state-adapter`（私有，MCP client SDK
+Hermes 侧参考实现见私有仓库 `hermes-user-state-adapter`（MCP client SDK
 编程式调用，模型无选择权）。
 
 ## 开发与验收
 
 ```bash
 pip install -e ".[dev,mcp]"
-pytest          # 62 tests: 单元 + D1-D12 验收 + REST + MCP stdio（含官方 SDK 互操作）
+pytest          # 74 tests: 单元 + D1-D12 验收 + REST + MCP stdio（含官方 SDK 互操作）+ 安全/恢复
 ```
 
-验收矩阵 `D1–D12` 与派单总纲 §15 一一对应（`tests/test_acceptance_d.py`）。
+验收矩阵 `D1–D12` 与派单总纲 §15 一一对应（`tests/test_acceptance_d.py`）；
+安全与恢复测试见 `tests/test_security.py`；CI 见 `.github/workflows/ci.yml`
+（Ubuntu/Windows × Python 3.10-3.13）。
 
 ## License
 

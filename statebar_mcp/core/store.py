@@ -135,14 +135,17 @@ class SQLiteStore:
 
     # -- events (event-level idempotency) -----------------------------------
 
-    def try_ingest_event(self, subject_id: str, event_id: str, observed_at: datetime) -> bool:
-        """Insert the event; returns False when it was already ingested."""
+    def try_ingest_event(self, subject_id: str, event_id: str, observed_at: datetime,
+                         status: str = "pending") -> bool:
+        """Insert the event (status 'pending' by default); returns False when
+        it already exists. The event only moves to 'sync_committed' AFTER the
+        synchronous path fully commits, so a crash leaves it retryable."""
         with self._lock:
             cur = self._conn.execute(
                 "INSERT OR IGNORE INTO ingested_events "
                 "(subject_id, event_id, observed_at, status, created_at) "
-                "VALUES (?, ?, ?, 'sync_committed', ?)",
-                (subject_id, event_id, _iso(observed_at), _iso(utc_now())),
+                "VALUES (?, ?, ?, ?, ?)",
+                (subject_id, event_id, _iso(observed_at), status, _iso(utc_now())),
             )
             self._conn.commit()
             return cur.rowcount > 0
@@ -165,9 +168,11 @@ class SQLiteStore:
 
     # -- observations (observation-level idempotency) ------------------------
 
-    def insert_observations(self, observations: List[Observation]) -> List[int]:
-        """Insert evidence rows; duplicates are ignored. Returns row ids."""
-        ids: List[int] = []
+    def insert_observations(self, observations: List[Observation]) -> List[Observation]:
+        """Insert evidence rows; duplicates are ignored. Returns the list of
+        observations that were actually NEWLY inserted (the caller reconciles
+        exactly those, so a retried event never double-records transitions)."""
+        inserted: List[Observation] = []
         with self._lock:
             for obs in observations:
                 cur = self._conn.execute(
@@ -198,9 +203,17 @@ class SQLiteStore:
                 # rowcount is the reliable signal for INSERT OR IGNORE:
                 # 1 = inserted, 0 = duplicate ignored.
                 if cur.rowcount > 0:
-                    ids.append(cur.lastrowid or 0)
+                    inserted.append(obs)
             self._conn.commit()
-        return ids
+        return inserted
+
+    def count_event_observations(self, subject_id: str, event_id: str) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM observations WHERE subject_id=? AND event_id=?",
+                (subject_id, event_id),
+            ).fetchone()
+        return int(row[0])
 
     def get_observations(self, subject_id: str, limit: int = 200) -> List[Observation]:
         with self._lock:

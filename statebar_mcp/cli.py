@@ -63,6 +63,7 @@ def _cmd_mcp(args) -> int:
 def _cmd_serve(args) -> int:
     import logging
 
+    from .config import is_loopback_host
     from .transports.rest import run_server
 
     handlers = [logging.StreamHandler()]
@@ -76,8 +77,23 @@ def _cmd_serve(args) -> int:
     service, cfg = _build_service(args.db)
     host = args.host or cfg.serve.host
     port = args.port or cfg.serve.port
+    token = cfg.serve.auth_token
+
+    # Fail-closed: never expose user state on a network interface without
+    # authentication. Loopback + no token is the only open configuration.
+    if not is_loopback_host(host) and not token:
+        logging.error(
+            "refusing to bind %s without an auth token: user state must not be "
+            "exposed on the network unauthenticated. Set DSH_USER_STATE_SERVE_TOKEN "
+            "(or serve.auth_token in config.json), or bind 127.0.0.1.",
+            host,
+        )
+        service.close()
+        return 2
+
     try:
-        run_server(service, host, port)
+        run_server(service, host, port, auth_token=token,
+                   max_body_bytes=cfg.serve.max_body_bytes)
     finally:
         service.close()
     return 0

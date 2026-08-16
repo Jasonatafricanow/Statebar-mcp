@@ -7,10 +7,19 @@ Stdlib-only HTTP server exposing the frozen Contract:
     GET  /v1/context-candidates  ?subject_id=
     GET  /v1/state               ?subject_id=&category=&key=
     GET  /v1/health
+
+Security (fail-closed):
+
+- Default bind is 127.0.0.1. The CLI REFUSES to start on a non-loopback
+  address without an auth token (``DSH_USER_STATE_SERVE_TOKEN``).
+- When a token is configured, EVERY endpoint — including /v1/health —
+  requires ``Authorization: Bearer <token>`` (constant-time compare).
+- Request bodies are capped (default 64 KiB → 413).
 """
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import urllib.parse
@@ -22,10 +31,15 @@ from .contract import Contract, ContractError
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_MAX_BODY_BYTES = 64 * 1024
+
 
 class _Handler(BaseHTTPRequestHandler):
     server_version = "statebar-mcp/0.1"
+    protocol_version = "HTTP/1.1"
     contract: Contract = None  # set by factory
+    auth_token: str = ""        # set by factory; "" disables auth
+    max_body_bytes: int = DEFAULT_MAX_BODY_BYTES
 
     def log_message(self, fmt, *args):  # quieter
         logger.debug("http %s %s", self.address_string(), fmt % args)
@@ -40,9 +54,50 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _authorized(self) -> bool:
+        """Bearer-token gate. No token configured = open (localhost mode)."""
+        if not self.auth_token:
+            return True
+        header = self.headers.get("Authorization", "")
+        scheme, _, provided = header.partition(" ")
+        if scheme.lower() != "bearer" or not provided:
+            return False
+        return hmac.compare_digest(provided.strip(), self.auth_token)
+
+    def _reject_unauthorized(self) -> None:
+        # Connection: close — the request body was never read; keep-alive
+        # would try to parse it as the next request and abort the socket.
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Bearer realm="statebar-mcp"')
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+    def _reject_body_too_large(self) -> None:
+        body = json.dumps({"error": "request body too large"}).encode("utf-8")
+        self.send_response(413)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+        self.close_connection = True
+
     def _read_json_body(self) -> Dict[str, Any]:
-        length = int(self.headers.get("Content-Length") or 0)
-        if length <= 0:
+        raw_length = self.headers.get("Content-Length") or "0"
+        try:
+            length = int(raw_length)
+        except ValueError:
+            self._send_json(400, {"error": "invalid Content-Length"})
+            raise _BodyRejected
+        if length < 0:
+            self._send_json(400, {"error": "invalid Content-Length"})
+            raise _BodyRejected
+        if length > self.max_body_bytes:
+            self._reject_body_too_large()
+            raise _BodyRejected
+        if length == 0:
             return {}
         raw = self.rfile.read(length)
         return json.loads(raw.decode("utf-8"))
@@ -57,6 +112,9 @@ class _Handler(BaseHTTPRequestHandler):
     # -- routes -------------------------------------------------------------------
 
     def do_GET(self) -> None:
+        if not self._authorized():
+            self._reject_unauthorized()
+            return
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
         params = self._query_params()
@@ -78,6 +136,9 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": str(exc)})
 
     def do_POST(self) -> None:
+        if not self._authorized():
+            self._reject_unauthorized()
+            return
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
         try:
@@ -86,6 +147,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json(200, self.contract.observe(body))
             else:
                 self._send_json(404, {"error": f"not found: {path}"})
+        except _BodyRejected:
+            return  # response already sent
         except ContractError as exc:
             self._send_json(400, {"error": str(exc)})
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
@@ -95,20 +158,49 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": str(exc)})
 
 
+class _BodyRejected(Exception):
+    """Internal: body was too large/invalid and a response was already sent."""
+
+
 def create_server(
-    service: UserStateService, host: str = "127.0.0.1", port: int = 8765
+    service: UserStateService,
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    auth_token: str = "",
+    max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
 ) -> ThreadingHTTPServer:
     handler = type(
-        "_ContractHandler", (_Handler,), {"contract": Contract(service)}
+        "_ContractHandler",
+        (_Handler,),
+        {
+            "contract": Contract(service),
+            "auth_token": auth_token,
+            "max_body_bytes": max_body_bytes,
+        },
     )
     server = ThreadingHTTPServer((host, port), handler)
     server.daemon_threads = True
     return server
 
 
-def run_server(service: UserStateService, host: str = "127.0.0.1", port: int = 8765) -> None:
-    server = create_server(service, host, port)
-    logger.info("statebar-mcp REST serving on http://%s:%d", host, port)
+def run_server(
+    service: UserStateService,
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    auth_token: str = "",
+    max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
+) -> None:
+    server = create_server(
+        service, host, port, auth_token=auth_token, max_body_bytes=max_body_bytes
+    )
+    if auth_token:
+        logger.info(
+            "statebar-mcp REST serving on http://%s:%d (Bearer auth REQUIRED)", host, port
+        )
+    else:
+        logger.info(
+            "statebar-mcp REST serving on http://%s:%d (no auth — loopback only)", host, port
+        )
     try:
         server.serve_forever()
     except KeyboardInterrupt:

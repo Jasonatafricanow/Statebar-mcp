@@ -7,9 +7,17 @@ The ONLY entry point for observing user state:
       → Fast Overlay (rules) → provisional Observations
       → Reconciler → commit → "accepted"
 
-    observe(request) asynchronous path (background thread):
+    observe(request) asynchronous path (single background worker):
       Persistent LLM Extraction → deterministic Validator
       → Reconciler → commit
+
+Event status state machine (recoverable, never swallows failures):
+
+    pending        event row inserted, processing not committed yet
+    sync_committed sync path committed (Fast Overlay + reconcile)
+    complete       async path finished (successful extraction, possibly empty)
+    failed         async extraction crashed → a later observe of the SAME
+                   event_id resumes processing instead of being dropped
 
 The asynchronous path is best-effort by design: when the extractor is
 blocked/unavailable (D3) the synchronous path has already committed and the
@@ -19,10 +27,10 @@ snapshot stays correct.
 from __future__ import annotations
 
 import logging
+import queue
 import threading
 from typing import Dict, List, Optional
 
-from . import lifecycle
 from .extractor.fast_overlay import FastOverlayExtractor
 from .extractor.persistent import PersistentExtractor
 from .lifecycle import lazy_expire
@@ -42,6 +50,9 @@ logger = logging.getLogger(__name__)
 
 __version__ = "0.1.0"
 
+_SENTINEL = object()
+_WORKER_JOIN_TIMEOUT_S = 5.0
+
 
 class UserStateService:
     """Stable internal Python interface (transport layer calls this)."""
@@ -60,8 +71,15 @@ class UserStateService:
         self.reconciler = Reconciler(store, now_fn=now_fn)
         self.snapshot_builder = SnapshotBuilder(store, now_fn=now_fn)
         self._closed = threading.Event()
-        self._threads: List[threading.Thread] = []
-        self._lock = threading.Lock()
+        # ONE bounded-lifecycle worker for the whole service (no per-event
+        # thread growth): tasks queue up, the worker drains them, close()
+        # joins it before closing the store.
+        self._queue: "queue.Queue" = queue.Queue()
+        self._worker: Optional[threading.Thread] = None
+        self._worker_lock = threading.Lock()
+        # Events whose async extraction is queued or in-flight right now.
+        self._in_flight: set = set()
+        self._in_flight_lock = threading.Lock()
 
     # ------------------------------------------------------------------ observe
 
@@ -69,60 +87,117 @@ class UserStateService:
         """Application-layer observe. Returns a JSON-safe result dict."""
         subject_id, event_id = request.subject_id, request.event_id
 
-        ingested = self.store.try_ingest_event(
-            subject_id, event_id, request.observed_at
-        )
-        if not ingested:
+        existing = self.store.get_event(subject_id, event_id)
+        status = existing["status"] if existing else None
+
+        if status == "complete":
             return {"status": "duplicate", "subject_id": subject_id, "event_id": event_id}
 
-        # ---- synchronous path: Fast Overlay → Reconciler → commit
+        if status is None:
+            self.store.try_ingest_event(subject_id, event_id, request.observed_at)
+            resuming = False
+        else:
+            # pending → previous sync path crashed before commit; failed →
+            # previous async extraction crashed. Both are recoverable.
+            resuming = True
+
+        # ---- synchronous path: Fast Overlay → Reconciler → commit.
+        # The event row stays 'pending' until this has fully committed, so a
+        # crash here can be retried instead of being swallowed as duplicate.
         sync_obs = self.fast_extractor.extract(
             subject_id, event_id, request.text, request.source, request.observed_at
         )
-        self.store.insert_observations(sync_obs)
-        sync_applied = self._reconcile_all(subject_id, sync_obs)
+        new_obs = self.store.insert_observations(sync_obs)
+        sync_applied = self._reconcile_all(subject_id, new_obs)
         self.store.set_event_status(subject_id, event_id, "sync_committed")
 
         result = {
-            "status": "accepted",
+            "status": "accepted" if not resuming else "resumed",
             "subject_id": subject_id,
             "event_id": event_id,
             "sync_observations": [o.to_dict() for o in sync_obs],
             "sync_states_changed": [s.to_dict() for s in sync_applied],
             "async_scheduled": False,
         }
+        if status in ("pending", "failed"):
+            result["resumed_from"] = status
 
-        # ---- asynchronous path: Persistent LLM extraction (best-effort)
+        # ---- asynchronous path: Persistent LLM extraction (best-effort).
         if self.persistent_extractor.available():
-            result["async_scheduled"] = True
-            self._schedule_async(request, start_index=len(sync_obs))
+            if self._mark_in_flight(subject_id, event_id):
+                if self._ensure_worker():
+                    start_index = self.store.count_event_observations(subject_id, event_id)
+                    self._queue.put((request, start_index))
+                    result["async_scheduled"] = True
+                else:
+                    self._unmark_in_flight(subject_id, event_id)
+        else:
+            # nothing more will ever happen for this event
+            self.store.set_event_status(subject_id, event_id, "complete")
         return result
 
-    def _schedule_async(self, request: ObserveRequest, start_index: int) -> None:
-        def worker() -> None:
-            if self._closed.is_set():
-                return
-            try:
-                observations = self.persistent_extractor.extract(request)
-                if observations:
-                    for obs in observations:
-                        obs.observation_index = start_index + obs.observation_index
-                        obs.subject_id = request.subject_id
-                        obs.event_id = request.event_id
-                    self.store.insert_observations(observations)
-                    self._reconcile_all(request.subject_id, observations)
-                self.store.set_event_status(request.subject_id, request.event_id, "complete")
-            except Exception:  # D3: async failure never breaks the sync path
-                logger.exception("persistent extraction failed for event %s", request.event_id)
+    # -- worker (single thread, bounded lifecycle) -----------------------------
 
-        thread = threading.Thread(
-            target=worker, name=f"persistent-extract-{request.event_id}", daemon=True
-        )
-        with self._lock:
+    def _mark_in_flight(self, subject_id: str, event_id: str) -> bool:
+        key = (subject_id, event_id)
+        with self._in_flight_lock:
+            if key in self._in_flight:
+                return False
+            self._in_flight.add(key)
+            return True
+
+    def _unmark_in_flight(self, subject_id: str, event_id: str) -> None:
+        with self._in_flight_lock:
+            self._in_flight.discard((subject_id, event_id))
+
+    def _ensure_worker(self) -> bool:
+        with self._worker_lock:
             if self._closed.is_set():
+                return False
+            if self._worker is None:
+                self._worker = threading.Thread(
+                    target=self._worker_loop,
+                    name="statebar-persistent-worker",
+                    daemon=True,
+                )
+                self._worker.start()
+            return True
+
+    def _worker_loop(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is _SENTINEL:
                 return
-            self._threads.append(thread)
-        thread.start()
+            # NOTE: tasks queued BEFORE close() are still processed (drain):
+            # close() joins this worker before closing the store, so these
+            # writes are always safe. New tasks cannot arrive after close
+            # (_ensure_worker refuses when closed).
+            request, start_index = item
+            try:
+                self._process_async(request, start_index)
+            finally:
+                self._unmark_in_flight(request.subject_id, request.event_id)
+
+    def _process_async(self, request: ObserveRequest, start_index: int) -> None:
+        subject_id, event_id = request.subject_id, request.event_id
+        status = "failed"
+        try:
+            observations = self.persistent_extractor.extract(request)
+            if observations:
+                for obs in observations:
+                    obs.observation_index = start_index + obs.observation_index
+                    obs.subject_id = subject_id
+                    obs.event_id = event_id
+                new_obs = self.store.insert_observations(observations)
+                self._reconcile_all(subject_id, new_obs)
+            status = "complete"
+        except Exception:  # D3: async failure never breaks the sync path
+            logger.exception("persistent extraction failed for event %s", event_id)
+        finally:
+            try:
+                self.store.set_event_status(subject_id, event_id, status)
+            except Exception:  # store may already be closed during shutdown
+                logger.debug("could not persist final event status for %s", event_id)
 
     def _reconcile_all(self, subject_id: str, observations: List[Observation]) -> List[State]:
         changed: List[State] = []
@@ -225,6 +300,16 @@ class UserStateService:
     # ------------------------------------------------------------------ lifecycle
 
     def close(self) -> None:
+        """Stop accepting work, drain queued async tasks, join the worker,
+        then close the extractor and the store (in that order, so no
+        background thread can ever write into a closed connection)."""
         self._closed.set()
+        try:
+            self._queue.put_nowait(_SENTINEL)
+        except queue.Full:  # pragma: no cover (unbounded queue)
+            pass
+        worker = self._worker
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(timeout=_WORKER_JOIN_TIMEOUT_S)
         self.persistent_extractor.close()
         self.store.close()
