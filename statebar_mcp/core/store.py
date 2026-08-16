@@ -108,6 +108,18 @@ CREATE TABLE IF NOT EXISTS state_transitions (
 
 CREATE INDEX IF NOT EXISTS idx_transitions_state
     ON state_transitions (state_id, id);
+
+-- Persistent "this observation was already applied" records (tombstones).
+-- Unlike the per-state last_observation_key (which later observations
+-- overwrite), this set is append-only: replaying an applied observation is
+-- blocked at the reconciler entry point, regardless of what happened to
+-- the states afterwards.
+CREATE TABLE IF NOT EXISTS observation_applications (
+    subject_id         TEXT NOT NULL,
+    event_id           TEXT NOT NULL,
+    observation_index  INTEGER NOT NULL,
+    PRIMARY KEY (subject_id, event_id, observation_index)
+);
 """
 
 
@@ -152,6 +164,33 @@ class SQLiteStore:
             self._conn.execute(
                 "ALTER TABLE states ADD COLUMN last_observation_key TEXT NOT NULL DEFAULT ''"
             )
+        # Backfill the applied-observation tombstone table from existing
+        # evidence: observations already marked reconciled were applied by
+        # definition; so were the observations recorded as the last writer
+        # of any state row.
+        self._conn.execute(
+            "INSERT OR IGNORE INTO observation_applications "
+            "(subject_id, event_id, observation_index) "
+            "SELECT subject_id, event_id, observation_index "
+            "FROM observations WHERE reconciled=1"
+        )
+        for row in self._conn.execute(
+            "SELECT DISTINCT subject_id, last_observation_key FROM states "
+            "WHERE last_observation_key != ''"
+        ).fetchall():
+            key = row["last_observation_key"]
+            if "::" in key:
+                event_id, _, index = key.rpartition("::")
+            else:
+                event_id, _, index = key.rpartition(":")
+            try:
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO observation_applications "
+                    "(subject_id, event_id, observation_index) VALUES (?, ?, ?)",
+                    (row["subject_id"], event_id, int(index)),
+                )
+            except (ValueError, sqlite3.Error):
+                continue
 
     # -- transactions -----------------------------------------------------------
 
@@ -276,6 +315,27 @@ class SQLiteStore:
         return int(row[0])
 
     # -- reconcile tracking (crash recovery) -----------------------------------
+
+    def is_observation_applied(self, subject_id: str, event_id: str,
+                               observation_index: int) -> bool:
+        """True when this observation was already reconciled (tombstone)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM observation_applications "
+                "WHERE subject_id=? AND event_id=? AND observation_index=?",
+                (subject_id, event_id, observation_index),
+            ).fetchone()
+        return row is not None
+
+    def mark_observation_applied(self, subject_id: str, event_id: str,
+                                 observation_index: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO observation_applications "
+                "(subject_id, event_id, observation_index) VALUES (?, ?, ?)",
+                (subject_id, event_id, observation_index),
+            )
+            self._commit_if_needed()
 
     def get_unreconciled_observations(
         self, subject_id: str, event_id: str

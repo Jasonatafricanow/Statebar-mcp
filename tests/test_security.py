@@ -413,6 +413,69 @@ class TestWorkerLifecycle:
         finally:
             service.close()
 
+    def test_legacy_replay_same_timestamp_no_resurrection(self):
+        """Reviewer's three-step repro: legacy observation A (awake) applied
+        but left unreconciled; a DIFFERENT same-timestamp observation B
+        (sleep) later owns the states. Replaying A must NOT resurrect awake
+        or supersede sleeping — no rollback of same-second evidence."""
+        store = SQLiteStore(":memory:")
+        service = UserStateService(store, persistent_extractor=MockExtractor())
+        t = datetime.now(timezone.utc)
+        req_a = ObserveRequest(
+            subject_id="u", event_id="eA", text="我刚睡醒",
+            source=Source(type="conversation"), observed_at=t,
+        )
+        req_b = ObserveRequest(
+            subject_id="u", event_id="eB", text="我睡了",
+            source=Source(type="conversation"), observed_at=t,
+        )
+        try:
+            # legacy A: ingest + persist observation + apply states WITHOUT
+            # the applied tombstone (old code path), crash before the
+            # reconciled mark
+            store.try_ingest_event("u", "eA", t)
+            obs_a = service.fast_extractor.extract("u", "eA", req_a.text, req_a.source, t)
+            store.insert_observations(obs_a)
+            rec = service.reconciler
+            rec._apply_inner(obs_a[0], rec._active_states("u"))
+            awake = store.get_state("u", "sleep", "awake")
+            assert awake is not None and awake.status == "active"
+
+            # B arrives normally, same semantic timestamp
+            r_b = service.observe(req_b)
+            assert r_b["status"] == "accepted"
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if store.get_event("u", "eB")["status"] == "complete":
+                    break
+                time.sleep(0.02)
+            sleeping = store.get_state("u", "sleep", "sleeping")
+            assert sleeping is not None and sleeping.status == "active"
+            transitions_before = len(store.get_transitions(sleeping.state_id))
+
+            # recovery replays A
+            r_a = service.observe(req_a)
+            assert r_a["status"] == "resumed"
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if store.get_event("u", "eA")["status"] == "complete":
+                    break
+                time.sleep(0.02)
+
+            # no resurrection, no rollback: sleeping stays active and owns
+            # the states; awake stays superseded; no new state rows
+            sleeping = store.get_state("u", "sleep", "sleeping")
+            assert sleeping.status == "active"
+            assert store.get_state("u", "sleep", "awake").status == "superseded"
+            awake_rows = [s for s in store.get_states("u") if s.key == "awake"]
+            assert len(awake_rows) == 1, "awake was resurrected as a new row"
+            assert len(store.get_transitions(sleeping.state_id)) == transitions_before
+            # and the replayed observation is now tombstoned + reconciled
+            assert store.is_observation_applied("u", "eA", 0)
+            assert store.get_unreconciled_observations("u", "eA") == []
+        finally:
+            service.close()
+
     def test_incomplete_body_401_is_bounded(self):
         """P2: a client declaring Content-Length but sending nothing must
         still receive the 401 within a bounded time — the reject-path drain

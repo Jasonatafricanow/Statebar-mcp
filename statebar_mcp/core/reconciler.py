@@ -91,6 +91,10 @@ class Reconciler:
             return False
         if latest.last_observation_key == self._obs_key(obs):
             return True  # this exact observation already applied
+        if obs.is_replay and latest.last_observed_at >= obs.observed_at:
+            # ambiguous legacy replay: a different observation at the same-or-
+            # later time already owns this key — do not create/resurrect.
+            return True
         if latest.last_observed_at > obs.observed_at:
             logger.debug(
                 "stale creation skipped: obs observed_at %s older than state %s last_observed %s",
@@ -165,6 +169,15 @@ class Reconciler:
                 obs_key, state.state_id,
             )
             return False
+        if obs.is_replay and obs.observed_at <= state.last_observed_at:
+            # ambiguous legacy replay: a DIFFERENT observation at the same-or-
+            # later semantic time already owns this state — never roll back.
+            logger.debug(
+                "legacy replay %s blocked: state %s owned by a different "
+                "observation at >= the same semantic time",
+                obs_key, state.state_id,
+            )
+            return False
         if obs.observed_at < state.last_observed_at:
             logger.debug(
                 "stale observation %s (observed %s < state last_observed %s); skipped",
@@ -199,6 +212,10 @@ class Reconciler:
         obs_key = self._obs_key(obs)
         if obs_key and state.last_observation_key == obs_key:
             return False
+        if obs.is_replay and obs_key and obs.observed_at <= state.last_observed_at:
+            # ambiguous legacy replay: a DIFFERENT observation at the same-or-
+            # later semantic time already owns this state — never roll back.
+            return False
         if obs is not None and obs.observed_at < state.last_observed_at:
             logger.debug(
                 "stale supersede skipped: obs %s < state last_observed %s",
@@ -216,9 +233,40 @@ class Reconciler:
     # -- entry point ----------------------------------------------------------
 
     def apply(self, obs: Observation) -> List[State]:
-        """Reconcile one observation. Returns states created/updated."""
+        """Reconcile one observation. Returns states created/updated.
+
+        Idempotent per observation: an applied-record tombstone is checked
+        BEFORE any rule runs and written AFTER the rules succeed (inside the
+        caller's transaction when there is one), so replays are skipped no
+        matter how the states changed afterwards."""
+        if self.store.is_observation_applied(
+            obs.subject_id, obs.event_id, obs.observation_index
+        ):
+            logger.debug(
+                "observation %s:%s already applied; replay skipped",
+                obs.event_id, obs.observation_index,
+            )
+            return []
         states = self._active_states(obs.subject_id)
-        return self._apply_inner(obs, states)
+        changed = self._apply_inner(obs, states)
+        self.store.mark_observation_applied(
+            obs.subject_id, obs.event_id, obs.observation_index
+        )
+        return changed
+
+    def _replay_blocked_by_latest(self, obs: Observation, key: str) -> bool:
+        """Replay-mode guard for creation branches: if ANY state with this
+        key (any status) was already touched by a DIFFERENT observation at
+        the same-or-later semantic time, the replayed observation must not
+        create/resurrect a state (the ambiguous legacy-crash case)."""
+        if not obs.is_replay:
+            return False
+        latest = self.store.get_latest_state_by_key(obs.subject_id, key)
+        if latest is None:
+            return False
+        if latest.last_observation_key == self._obs_key(obs):
+            return True  # exact same observation already applied
+        return latest.last_observed_at >= obs.observed_at
 
     def _apply_inner(self, obs: Observation, states: List[State]) -> List[State]:
         changed: List[State] = []
@@ -262,6 +310,8 @@ class Reconciler:
                 ):
                     changed.append(awake)
             return changed
+        if self._replay_blocked_by_latest(obs, "awake"):
+            return changed  # legacy replay must not resurrect a superseded wake
         valid_until = obs.observed_at + timedelta(hours=lifecycle.TTL_AWAKE_HOURS)
         new = self._create(
             obs, "sleep", "awake", "awake", StateStatus.ACTIVE, Certainty.CONFIRMED,
@@ -290,6 +340,8 @@ class Reconciler:
             ):
                 changed.append(sleeping)
             return changed
+        if self._replay_blocked_by_latest(obs, "sleeping"):
+            return changed  # legacy replay must not resurrect a superseded sleep
         valid_until = obs.observed_at + timedelta(hours=lifecycle.TTL_SLEEP_HOURS)
         new = self._create(
             obs, "sleep", "sleeping", obs.value or "sleeping", StateStatus.ACTIVE,

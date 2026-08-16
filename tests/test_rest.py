@@ -61,6 +61,33 @@ class TestRESTErrors:
         code, body = _get(server, "/nope")
         assert code == 404
 
+    def test_source_string_form_accepted(self):
+        """b5606ef regression: the contract documents source as a scalar
+        (source="diary"); it must parse like the dict form, not 500."""
+        service = UserStateService(SQLiteStore(":memory:"))
+        srv = create_server(service, "127.0.0.1", 0)
+        port = srv.server_address[1]
+        thread = threading.Thread(target=srv.serve_forever, daemon=True)
+        thread.start()
+        try:
+            code, body = _post(
+                port,
+                "/v1/observe",
+                {
+                    "subject_id": "u",
+                    "event_id": "e1",
+                    "text": "我刚睡醒",
+                    "source": "diary",
+                },
+            )
+            assert code == 200 and body["status"] == "accepted"
+            obs = service.store.get_observations("u")
+            assert obs and obs[0].source.type == "diary"
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            service.close()
+
     def test_400_invalid_json(self, server):
         code, body = _post(server, "/v1/observe", b"{not json", raw=True)
         assert code == 400

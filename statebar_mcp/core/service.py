@@ -105,15 +105,20 @@ class UserStateService:
         # The event row stays 'pending' until this fully commits, so a crash
         # here can be retried instead of being swallowed as duplicate.
         # ONE SQLite transaction: observation insert + state/transition
-        # writes + reconciled marks + event status commit atomically —
-        # recovery replay can never double-apply any part of it.
+        # writes + reconciled marks + applied tombstones + event status
+        # commit atomically — recovery replay can never double-apply any
+        # part of it.
         sync_obs = self.fast_extractor.extract(
             subject_id, event_id, request.text, request.source, request.observed_at
         )
+        # leftovers = persisted-but-unreconciled rows from a crashed earlier
+        # attempt; they are replayed with STRICT conflict rules (is_replay).
+        leftovers = self.store.get_unreconciled_observations(subject_id, event_id)
+        replay_keys = {(o.event_id, o.observation_index) for o in leftovers}
         with self.store.transaction():
             self.store.insert_observations(sync_obs)
             unreconciled = self.store.get_unreconciled_observations(subject_id, event_id)
-            sync_applied = self._reconcile_all(subject_id, unreconciled)
+            sync_applied = self._reconcile_all(subject_id, unreconciled, replay_keys)
             self.store.mark_observations_reconciled(subject_id, event_id, unreconciled)
             self.store.set_event_status(subject_id, event_id, "sync_committed")
 
@@ -190,6 +195,8 @@ class UserStateService:
         subject_id, event_id = request.subject_id, request.event_id
         try:
             observations = self.persistent_extractor.extract(request)
+            leftovers = self.store.get_unreconciled_observations(subject_id, event_id)
+            replay_keys = {(o.event_id, o.observation_index) for o in leftovers}
             with self.store.transaction():
                 if observations:
                     for obs in observations:
@@ -202,7 +209,7 @@ class UserStateService:
                 # mark them reconciled — all in the SAME transaction as the
                 # state/transition writes and the final event status.
                 unreconciled = self.store.get_unreconciled_observations(subject_id, event_id)
-                self._reconcile_all(subject_id, unreconciled)
+                self._reconcile_all(subject_id, unreconciled, replay_keys)
                 self.store.mark_observations_reconciled(subject_id, event_id, unreconciled)
                 self.store.set_event_status(subject_id, event_id, "complete")
         except Exception:  # D3: async failure never breaks the sync path
@@ -212,10 +219,17 @@ class UserStateService:
             except Exception:  # store may already be closed during shutdown
                 logger.debug("could not persist final event status for %s", event_id)
 
-    def _reconcile_all(self, subject_id: str, observations: List[Observation]) -> List[State]:
+    def _reconcile_all(
+        self,
+        subject_id: str,
+        observations: List[Observation],
+        replay_keys: set = frozenset(),
+    ) -> List[State]:
         changed: List[State] = []
         # semantic ordering (D12): older observations first
         for obs in sorted(observations, key=lambda o: (o.observed_at, o.observation_index)):
+            if (obs.event_id, obs.observation_index) in replay_keys:
+                obs.is_replay = True  # strict conflict rules for leftovers
             changed.extend(self.reconciler.apply(obs))
         return changed
 

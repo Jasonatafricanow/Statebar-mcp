@@ -167,6 +167,12 @@ class Observation:
     confidence: float = 1.0
     raw_payload: str = ""
     observation_index: int = 0
+    # Transient, never persisted: True when this observation is a REPLAY of
+    # a persisted-but-unreconciled leftover (crash recovery). Replay mode
+    # applies stricter conflict rules: a state already touched by a DIFFERENT
+    # observation at the same-or-later semantic time is off-limits, so old
+    # replays can never roll back or resurrect newer state.
+    is_replay: bool = field(default=False, repr=False, compare=False)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
