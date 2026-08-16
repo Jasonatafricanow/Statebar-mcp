@@ -68,9 +68,26 @@ class _Handler(BaseHTTPRequestHandler):
             return False
         return hmac.compare_digest(provided.strip(), self.auth_token)
 
+    def _drain_request_body(self) -> None:
+        """Read and discard any unread request body (capped) so the socket
+        closes cleanly. On Windows, closing a keep-alive socket with unread
+        inbound data can send RST and abort the client's in-flight read of
+        our error response (WinError 10053)."""
+        raw = self.headers.get("Content-Length") or "0"
+        try:
+            length = int(raw)
+        except ValueError:
+            return
+        if length > 0:
+            try:
+                self.rfile.read(min(length, self.max_body_bytes))
+            except OSError:  # pragma: no cover
+                pass
+
     def _reject_unauthorized(self) -> None:
         # Connection: close — the request body was never read; keep-alive
         # would try to parse it as the next request and abort the socket.
+        self._drain_request_body()
         self.send_response(401)
         self.send_header("WWW-Authenticate", 'Bearer realm="statebar-mcp"')
         self.send_header("Content-Length", "0")
@@ -79,6 +96,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.close_connection = True
 
     def _reject_body_too_large(self) -> None:
+        self._drain_request_body()
         body = json.dumps({"error": "request body too large"}).encode("utf-8")
         self.send_response(413)
         self.send_header("Content-Type", "application/json; charset=utf-8")
