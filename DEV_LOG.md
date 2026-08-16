@@ -92,6 +92,21 @@
 4. 测试 78 → **80 passed**（6 连跑全绿）；test_unit 的 obs() 助手改为唯一
    event_id（幂等键在现实中以 UNIQUE(event_id,index) 为前提）。
 
+### 复评第四轮（P1 历史 observation 去重边界）
+
+1. **持久化已应用记录**：新增 `observation_applications` 表（tombstone，append-only，
+   PK=(subject_id,event_id,observation_index)）。`reconciler.apply()` 入口先查 tombstone、
+   规则成功后同事务写入——不受 state.last_observation_key 被后续 observation 覆盖的影响。
+   迁移时从 reconciled=1 的 observations 与 states.last_observation_key 回填。
+2. **重放严格冲突守卫**（治旧数据）：observation 增加瞬时 `is_replay` 标记，仅对
+   恢复重放的 observation 生效——目标状态若已被**不同** observation 在同一或更晚
+   语义时间占有，则拒绝变更/创建/复活（评审三步复现：legacy A=awake 未标记，
+   B=sleep 同时刻接管，重放 A 不再复活 awake / 推翻 sleeping）。
+3. 评审复现固化为 `test_legacy_replay_same_timestamp_no_resurrection`；
+   补 b5606ef（source 字符串）回归测试 `test_source_string_form_accepted`。
+4. 测试 80 → **82 passed**（6 连跑全绿）。
+5. 推送 `v0.1.0-rc1` 标签触发 CI（workflow 对 `v*` 标签触发）。
+
 ### 待办
 - [ ] 首个 PyPI 发布（0.1.0，发布后 README 的 pip install 生效）
 - [ ] 确认仓库 Actions 已启用（本地无法访问 GitHub API；工作流文件已在 master 树中，可手动 dispatch）
