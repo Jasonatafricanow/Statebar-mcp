@@ -54,8 +54,29 @@
 9. **env 布尔解析**：`"0"` 不再被当作 True（`_env_bool` 白名单）。
 10. 新增 `tests/test_security.py`（认证/fail-closed/413/隐私开关/事件恢复/worker 生命周期）。
 
+### 复评修复（第二轮，按评审复评逐项）
+
+1. **[P1] MCP stdio 强制 UTF-8**：Windows 管道默认 ANSI 代码页（GBK），中文在协议边界被破坏。
+   `force_utf8_stdio()` 显式 `reconfigure(encoding="utf-8")`，不依赖 PYTHONUTF8/PYTHONIOENCODING；
+   回归测试在子进程环境剥离这两个变量后发送中文（此前全绿是继承 PYTHONUTF8 的假象）。
+2. **[P1] observation 与 reconcile 原子性**：observations 表新增 `reconciled` 标记列；
+   insert 与 reconcile 之间的崩溃窗口在下次 observe 时重放所有未 reconcile 的 observation，
+   不再因 `INSERT OR IGNORE` 吞掉状态。顺带修复 v0.1 遗留 bug：observations 表原本没有
+   `time_expression` 列（内存对象 reconcile 所以测试未暴露），补列 + 迁移，
+   恢复路径从 DB 重读后语义窗口不再丢失。
+3. **[P1] worker 关闭可靠 join**：close() 跳过未开始的排队任务（事件保持 sync_committed 可恢复），
+   等待在途任务完成——宽限 = 抽取器自身超时 + 5s，仍存活则无界 join（受在途请求超时约束），
+   确保 store 关闭前 worker 已退出。
+4. **[P2] fail-closed 下沉**：非回环无 token 的拒绝从 CLI 下沉到 `create_server`，
+   库调用方无法绕过。
+5. **Windows RST(10053) 竞态**：401/413 拒绝路径先排空请求体再关闭连接，
+   消除 keep-alive 未读数据触发 RST 导致的偶发 ConnectionAbortedError（8 连跑全绿）。
+6. 测试从 74 → **78 passed**（新增：中文 stdio 无 PYTHONUTF8、崩溃窗口恢复、close 在途/丢弃语义、
+   create_server fail-closed）；CI 增加 `workflow_dispatch` 与 tag 触发。
+
 ### 待办
 - [ ] 首个 PyPI 发布（0.1.0，发布后 README 的 pip install 生效）
+- [ ] 确认仓库 Actions 已启用（本地无法访问 GitHub API；工作流文件已在 master 树中，可手动 dispatch）
 - [ ] mcp_http.py（Streamable HTTP，可选 transport，§5 标为可选；Phase 1 已交付 stdio+serve）
 - [ ] 示例 adapter、开源社区收尾
 
