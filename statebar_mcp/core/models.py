@@ -139,6 +139,10 @@ class Source:
 
     @classmethod
     def from_dict(cls, data: Optional[Dict[str, Any]]) -> "Source":
+        # 兼容字符串形式：source="diary" / "conversation" → type；dict 形式完整解析。
+        # 修复：REST 契约文档写 source 为标量，但原实现只接受 dict → 500 (str.get)。
+        if isinstance(data, str):
+            return cls(type=data or SourceType.CONVERSATION)
         data = data or {}
         return cls(
             type=str(data.get("type") or SourceType.CONVERSATION),
