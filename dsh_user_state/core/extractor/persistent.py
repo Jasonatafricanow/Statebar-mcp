@@ -98,8 +98,11 @@ class OpenAICompatExtractor(PersistentExtractor):
         try:
             content = data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError):
-            logger.warning("persistent extractor: unexpected response shape")
+            logger.warning(
+                "persistent extractor: unexpected response shape: %.300s", str(data)
+            )
             return []
+        logger.debug("persistent extractor raw content: %.500s", content)
         return _parse_llm_json(content, request)
 
 
@@ -118,9 +121,11 @@ def _parse_llm_json(content: str, request: ObserveRequest) -> List[Observation]:
     try:
         payload = json.loads(text)
     except json.JSONDecodeError:
-        logger.warning("persistent extractor: invalid JSON from model")
+        logger.warning(
+            "persistent extractor: invalid JSON from model: %.300s", text
+        )
         return []
-    return validator.validate_observations(
+    observations = validator.validate_observations(
         payload,
         request.subject_id,
         request.event_id,
@@ -128,6 +133,12 @@ def _parse_llm_json(content: str, request: ObserveRequest) -> List[Observation]:
         request.observed_at,
         start_index=0,
     )
+    if isinstance(payload, list) and payload and not observations:
+        logger.warning(
+            "persistent extractor: model payload validated to zero observations: %.300s",
+            str(payload),
+        )
+    return observations
 
 
 # ---------------------------------------------------------------------------

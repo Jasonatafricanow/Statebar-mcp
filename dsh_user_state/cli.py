@@ -23,6 +23,7 @@ def main(argv=None) -> int:
     p_serve = sub.add_parser("serve", help="REST service (multi-client shared)")
     p_serve.add_argument("--host", default=None, help="bind host (default 127.0.0.1)")
     p_serve.add_argument("--port", type=int, default=None, help="bind port (default 8765)")
+    p_serve.add_argument("--log-file", default=None, help="append logs to a file (daemon mode)")
     p_serve.set_defaults(func=_cmd_serve)
 
     p_health = sub.add_parser("health", help="print service health (CLI check)")
@@ -64,9 +65,13 @@ def _cmd_serve(args) -> int:
 
     from .transports.rest import run_server
 
+    handlers = [logging.StreamHandler()]
+    if args.log_file:
+        handlers.append(logging.FileHandler(args.log_file, encoding="utf-8"))
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=handlers,
     )
     service, cfg = _build_service(args.db)
     host = args.host or cfg.serve.host
