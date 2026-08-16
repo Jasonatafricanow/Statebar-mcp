@@ -35,8 +35,13 @@ class SourceType:
     DIARY = "diary"
     HEALTH = "health"
     ASSISTANT_QUESTION = "assistant_question"
+    # V2: the user's real-time behavior itself (message received, voice,
+    # confirmed action) is a first-class evidence source — distinct from the
+    # language semantics of what was said.
+    INTERACTION = "interaction"
+    SYSTEM = "system"
 
-    ALL = {CONVERSATION, DIARY, HEALTH, ASSISTANT_QUESTION}
+    ALL = {CONVERSATION, DIARY, HEALTH, ASSISTANT_QUESTION, INTERACTION, SYSTEM}
 
 
 class Certainty:
@@ -45,8 +50,11 @@ class Certainty:
     TENTATIVE = "tentative"
     ESTIMATED = "estimated"
     INFERRED = "inferred"
+    # V2: directly observed by the system (not extracted, not inferred) —
+    # e.g. "a user interaction happened at 14:37".
+    OBSERVED = "observed"
 
-    ALL = {CONFIRMED, PLANNED, TENTATIVE, ESTIMATED, INFERRED}
+    ALL = {CONFIRMED, PLANNED, TENTATIVE, ESTIMATED, INFERRED, OBSERVED}
 
 
 class StateStatus:
@@ -331,6 +339,62 @@ class ObserveRequest:
             source=Source.from_dict(data.get("source")),
             observed_at=parse_dt(data.get("observed_at") or utc_now().isoformat()),
         )
+
+
+# ---------------------------------------------------------------------------
+# V2: Transition Intent (Inference Engine → Reconciler protocol)
+# ---------------------------------------------------------------------------
+
+
+class IntentAction:
+    ESTABLISH = "ESTABLISH"
+    UPDATE = "UPDATE"
+    SUPERSEDE = "SUPERSEDE"
+    RESOLVE = "RESOLVE"
+    EXPIRE = "EXPIRE"
+    NOOP = "NOOP"
+
+    ALL = {ESTABLISH, UPDATE, SUPERSEDE, RESOLVE, EXPIRE, NOOP}
+
+
+@dataclass
+class TransitionIntent:
+    """A bounded state-mutation request produced by the Inference Engine.
+
+    NOT an LLM output contract. The Reconciler validates and executes it
+    deterministically (stale guards, idempotency, transition legality,
+    history), and remains the only writer of Canonical State.
+    """
+    action: str
+    reason: str
+    evidence: List[str] = field(default_factory=list)  # observation keys
+    # SUPERSEDE / UPDATE / RESOLVE / EXPIRE target:
+    target_state_id: str = ""
+    target_category: str = ""
+    target_key: str = ""
+    # ESTABLISH payload:
+    category: str = ""
+    key: str = ""
+    value: str = ""
+    status: str = StateStatus.ACTIVE
+    certainty: str = Certainty.OBSERVED
+    followup_relevant: bool = False
+    snapshot_priority: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "action": self.action,
+            "reason": self.reason,
+            "evidence": self.evidence,
+            "target_state_id": self.target_state_id,
+            "target_category": self.target_category,
+            "target_key": self.target_key,
+            "category": self.category,
+            "key": self.key,
+            "value": self.value,
+            "status": self.status,
+            "certainty": self.certainty,
+        }
 
 
 @dataclass

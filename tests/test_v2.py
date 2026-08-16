@@ -1,0 +1,264 @@
+"""V2 acceptance tests (Spec §21): the interaction → awake vertical slice.
+
+V2-T1..T8. External Contract compatibility (V2-T8) is additionally proven by
+the entire V1 suite (D1-D12, security, MCP stdio) staying green.
+"""
+
+from __future__ import annotations
+
+import sys
+import threading
+import time
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from statebar_mcp.core.extractor.persistent import MockExtractor  # noqa: E402
+from statebar_mcp.core.models import (  # noqa: E402
+    Certainty,
+    ObserveRequest,
+    Source,
+    SourceType,
+    StateStatus,
+)
+from statebar_mcp.core.service import UserStateService  # noqa: E402
+from statebar_mcp.core.store import SQLiteStore  # noqa: E402
+from statebar_mcp.transports.rest import create_server  # noqa: E402
+
+LOCAL_TZ = datetime.now().astimezone().tzinfo
+
+
+def local_dt(y, mo, d, h, mi, s=0):
+    return datetime(y, mo, d, h, mi, s, tzinfo=LOCAL_TZ)
+
+
+class FixedClock:
+    def __init__(self, start):
+        self.now_dt = start
+
+    def __call__(self):
+        return self.now_dt
+
+    def set(self, dt):
+        self.now_dt = dt
+
+
+def make_service(clock=None):
+    store = SQLiteStore(":memory:")
+    service = UserStateService(
+        store,
+        persistent_extractor=MockExtractor(),
+        now_fn=clock or (lambda: datetime.now(timezone.utc)),
+    )
+    return service, store
+
+
+def observe(service, subject_id, event_id, text, observed_at, source_type="conversation"):
+    return service.observe(
+        ObserveRequest(
+            subject_id=subject_id,
+            event_id=event_id,
+            text=text,
+            source=Source(type=source_type),
+            observed_at=observed_at,
+        )
+    )
+
+
+def wait_complete(store, subject_id, event_id, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        ev = store.get_event(subject_id, event_id)
+        if ev and ev["status"] == "complete":
+            return True
+        time.sleep(0.02)
+    return False
+
+
+class TestV2InteractionSlice:
+    def test_T1_sleeping_superseded_by_any_user_message(self):
+        """sleeping active + arbitrary message (no wake words) → superseded."""
+        service, store = make_service()
+        t1 = datetime.now(timezone.utc)
+        t2 = t1 + timedelta(minutes=30)
+        try:
+            observe(service, "u", "e1", "我睡了", t1)
+            assert store.get_state("u", "sleep", "sleeping").status == "active"
+
+            observe(service, "u", "e2", "背有点僵", t2)
+            sleeping = store.get_state("u", "sleep", "sleeping")
+            assert sleeping.status == StateStatus.SUPERSEDED
+            awake = store.get_state("u", "sleep", "awake")
+            assert awake is not None and awake.status == StateStatus.ACTIVE
+        finally:
+            service.close()
+
+    def test_T2_interaction_observation_created(self):
+        """The interaction itself is recorded as an observation — not a
+        direct state mutation."""
+        service, store = make_service()
+        try:
+            t = datetime.now(timezone.utc)
+            observe(service, "u", "e1", "股票怎么回事", t)
+            obs = store.get_observations("u")
+            interactions = [
+                o for o in obs
+                if o.key == "interactive_activity" and o.category == "presence"
+            ]
+            assert len(interactions) == 1
+            it = interactions[0]
+            assert it.type == "activity"
+            assert it.certainty == Certainty.OBSERVED
+            assert it.confidence == 1.0
+            assert it.source.type == SourceType.INTERACTION
+        finally:
+            service.close()
+
+    def test_T3_transition_traceability(self):
+        """The history must trace: interaction observation → awake inference
+        → sleeping superseded."""
+        service, store = make_service()
+        t1 = datetime.now(timezone.utc)
+        t2 = t1 + timedelta(minutes=10)
+        try:
+            observe(service, "u", "e1", "我睡了", t1)
+            sleeping = store.get_state("u", "sleep", "sleeping")
+            observe(service, "u", "e2", "哈哈", t2)
+            transitions = store.get_transitions(sleeping.state_id)
+            supersede = [t for t in transitions if t.to_status == StateStatus.SUPERSEDED]
+            assert len(supersede) == 1
+            assert "interactive_activity" in supersede[0].reason
+            assert "wakefulness" in supersede[0].reason
+            # the evidence observation exists and is reconciled
+            interactions = [
+                o for o in store.get_observations("u")
+                if o.key == "interactive_activity" and o.event_id == "e2"
+            ]
+            assert interactions
+            assert store.is_observation_applied(
+                "u", "e2", interactions[0].observation_index
+            ), "interaction observation tombstone missing"
+        finally:
+            service.close()
+
+    def test_T4_assistant_question_produces_no_interaction(self):
+        service, store = make_service()
+        try:
+            t = datetime.now(timezone.utc)
+            observe(
+                service, "u", "e1", "你还醒着吗？", t,
+                source_type=SourceType.ASSISTANT_QUESTION,
+            )
+            obs = store.get_observations("u")
+            assert not any(o.key == "interactive_activity" for o in obs)
+            assert all(
+                s.key != "awake" for s in store.get_states("u")
+            )  # S1 still holds
+        finally:
+            service.close()
+
+    def test_T5_delayed_message_does_not_supersede_newer_sleep(self):
+        clock = FixedClock(local_dt(2026, 8, 16, 14, 0).astimezone(timezone.utc))
+        service, store = make_service(clock=clock)
+        try:
+            observe(service, "u", "e1", "我睡了", clock())
+            sleeping = store.get_state("u", "sleep", "sleeping")
+            assert sleeping.status == "active"
+
+            # a delayed user message, semantic time BEFORE the sleep state
+            delayed = local_dt(2026, 8, 16, 13, 50).astimezone(timezone.utc)
+            observe(service, "u", "e2", "背有点僵", delayed)
+
+            assert store.get_state("u", "sleep", "sleeping").status == "active"
+            awake = store.get_state("u", "sleep", "awake")
+            assert awake is None or awake.status != StateStatus.ACTIVE, (
+                "delayed interaction must not establish awake over newer sleep"
+            )
+        finally:
+            service.close()
+
+    def test_T6_no_wake_time_claim_from_interaction(self):
+        """14:37 interaction must express 'awake confirmed at ~14:37', never
+        'awake since ~14:37' (no invented wake time)."""
+        clock = FixedClock(local_dt(2026, 8, 16, 14, 37).astimezone(timezone.utc))
+        service, store = make_service(clock=clock)
+        try:
+            observe(service, "u", "e1", "背有点僵", clock())
+            snap = service.get_snapshot("u")
+            assert "awake confirmed at ~14:37" in snap.text
+            assert "awake since" not in snap.text
+            # an explicit wake claim later upgrades to a real "since"
+            clock.set(local_dt(2026, 8, 16, 15, 0).astimezone(timezone.utc))
+            observe(service, "u", "e2", "我刚睡醒", clock())
+            snap2 = service.get_snapshot("u")
+            assert "awake since ~15:00" in snap2.text
+        finally:
+            service.close()
+
+    def test_T7_explicit_awake_still_works(self):
+        service, store = make_service()
+        try:
+            t = datetime.now(timezone.utc)
+            observe(service, "u", "e1", "我刚睡醒", t)
+            awake = store.get_state("u", "sleep", "awake")
+            assert awake is not None and awake.status == StateStatus.ACTIVE
+            snap = service.get_snapshot("u")
+            assert "awake since" in snap.text
+        finally:
+            service.close()
+
+    def test_T8_external_contract_unchanged(self):
+        """observe/snapshot over the frozen REST contract behave exactly as
+        in V1 (V2 must not break the external protocol)."""
+        service, store = make_service()
+        srv = create_server(service, "127.0.0.1", 0)
+        port = srv.server_address[1]
+        thread = threading.Thread(target=srv.serve_forever, daemon=True)
+        thread.start()
+        try:
+            import json
+
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/v1/observe",
+                data=json.dumps(
+                    {"subject_id": "u", "event_id": "e1", "text": "我刚睡醒"}
+                ).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+            assert body["status"] == "accepted"
+            assert "sync_observations" in body  # V1 response shape unchanged
+
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/v1/snapshot?subject_id=u", timeout=5
+            ) as resp:
+                snap = json.loads(resp.read().decode("utf-8"))
+            assert snap["text"].startswith("CURRENT USER STATE")
+            assert "awake" in snap["text"]
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            service.close()
+
+
+class TestV2EvidencePrecedence:
+    def test_explicit_sleep_beats_same_event_interaction(self):
+        """The user says 我睡了 — the interaction evidence from the SAME
+        event must NOT wake them back up (explicit language > behavior)."""
+        service, store = make_service()
+        try:
+            t = datetime.now(timezone.utc)
+            observe(service, "u", "e1", "我睡了", t)
+            sleeping = store.get_state("u", "sleep", "sleeping")
+            assert sleeping.status == "active", (
+                "interaction evidence contradicted an explicit sleep claim"
+            )
+        finally:
+            service.close()

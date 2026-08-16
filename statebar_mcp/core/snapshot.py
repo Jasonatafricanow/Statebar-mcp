@@ -158,7 +158,12 @@ class SnapshotBuilder:
         key, category, status = state.key, state.category, state.status
 
         if category == "sleep" and key == "awake":
-            text = f"awake since ~{_hhmm(state.valid_from)}"
+            if state.value == "awake_confirmed":
+                # V2-T6: interaction evidence confirms wakefulness but does
+                # NOT claim a wake time — render the confirmation time only.
+                text = f"awake confirmed at ~{_hhmm(state.last_observed_at)}"
+            else:
+                text = f"awake since ~{_hhmm(state.valid_from)}"
         elif category == "sleep" and key == "sleeping":
             text = "preparing to sleep" if state.value == "preparing_sleep" else "sleeping"
         elif key == "medication":

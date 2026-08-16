@@ -1,7 +1,9 @@
-"""State Reconciler — the frozen ruleset (派单总纲 §10).
+"""State Reconciler — the deterministic safety gate (派单总纲 §10, V2 §13).
 
-Business rules R1-R10, system rules S1-S2, plus the conservative principle
-and the out-of-order guard (semantic observed_at ordering, D12).
+V1: business rules R1-R10 + system rules S1-S2 (kept during migration).
+V2: executes TransitionIntents produced by the Inference Engine — the
+Reconciler remains the ONLY Canonical State writer and validates every
+mutation (stale guards, idempotency, transition legality, history).
 
 Every mutation is expressed as a State + StateTransition pair, so S2
 (non-destructive history) holds by construction. Unknown relations are
@@ -15,14 +17,17 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 from . import lifecycle
+from .inference import InferenceEngine
 from .models import (
     Certainty,
+    IntentAction,
     Observation,
     ObservationType,
     SourceType,
     State,
     StateStatus,
     StateTransition,
+    TransitionIntent,
     utc_now,
 )
 from .store import SQLiteStore
@@ -41,9 +46,10 @@ _NON_TERMINAL = tuple(
 class Reconciler:
     """Applies one validated Observation against the canonical state store."""
 
-    def __init__(self, store: SQLiteStore, now_fn=utc_now):
+    def __init__(self, store: SQLiteStore, now_fn=utc_now, inference=None):
         self.store = store
         self._now_fn = now_fn
+        self.inference = inference or InferenceEngine()
 
     def _now(self) -> datetime:
         return self._now_fn()
@@ -235,10 +241,16 @@ class Reconciler:
     def apply(self, obs: Observation) -> List[State]:
         """Reconcile one observation. Returns states created/updated.
 
+        V2 flow: the Inference Engine turns the observation into
+        TransitionIntents (ontology-driven); when it owns the observation,
+        the intents are validated and executed here — the Reconciler remains
+        the ONLY Canonical State writer. Observations the inference layer
+        does not (yet) own fall back to the V1 rule handlers.
+
         Idempotent per observation: an applied-record tombstone is checked
-        BEFORE any rule runs and written AFTER the rules succeed (inside the
-        caller's transaction when there is one), so replays are skipped no
-        matter how the states changed afterwards."""
+        BEFORE anything runs and written AFTER success (inside the caller's
+        transaction when there is one), so replays are skipped no matter how
+        the states changed afterwards."""
         if self.store.is_observation_applied(
             obs.subject_id, obs.event_id, obs.observation_index
         ):
@@ -248,11 +260,117 @@ class Reconciler:
             )
             return []
         states = self._active_states(obs.subject_id)
-        changed = self._apply_inner(obs, states)
+        intents, handled = self.inference.infer(obs, states)
+        if handled:
+            changed = self._execute_intents(obs, states, intents)
+        else:
+            changed = self._apply_inner(obs, states)
         self.store.mark_observation_applied(
             obs.subject_id, obs.event_id, obs.observation_index
         )
         return changed
+
+    # -- V2 intent execution (deterministic safety gate) -----------------------
+
+    def _execute_intents(
+        self, obs: Observation, states: List[State], intents: List[TransitionIntent]
+    ) -> List[State]:
+        changed: List[State] = []
+        for intent in intents:
+            if intent.action == IntentAction.NOOP:
+                continue
+            if intent.action == IntentAction.SUPERSEDE:
+                target = self._intent_target(states, intent)
+                if target is None:
+                    continue  # already gone (e.g. replayed) — nothing to do
+                if self._supersede(target, obs, intent.reason):
+                    changed.append(target)
+            elif intent.action == IntentAction.ESTABLISH:
+                if self._is_stale_creation(obs, states, intent.key):
+                    continue
+                if self._replay_blocked_by_latest(obs, intent.key):
+                    continue
+                valid_until = obs.observed_at + timedelta(
+                    hours=lifecycle.TTL_AWAKE_HOURS
+                )
+                new = self._create(
+                    obs, intent.category, intent.key, intent.value, intent.status,
+                    intent.certainty, obs.observed_at, valid_until, valid_until,
+                    intent.followup_relevant, intent.snapshot_priority,
+                )
+                self._apply(
+                    new,
+                    self._transition(new, new.status, intent.reason, obs),
+                )
+                changed.append(new)
+            elif intent.action == IntentAction.UPDATE:
+                target = self._intent_target(states, intent)
+                if target is None:
+                    continue
+                semantic_change = (
+                    (intent.value not in (None, "", target.value))
+                    or (intent.status and intent.status != target.status)
+                    or (intent.certainty and intent.certainty != target.certainty)
+                )
+                if semantic_change:
+                    if self._mutate(
+                        target, obs,
+                        status=intent.status or None,
+                        value=intent.value or None,
+                        certainty=intent.certainty or None,
+                        reason=intent.reason,
+                    ):
+                        changed.append(target)
+                else:
+                    # pure re-confirmation: refresh the confirmation time
+                    # without a transition row (S2 applies to semantic
+                    # changes; this is bookkeeping like updated_at)
+                    if self._touch(target, obs):
+                        changed.append(target)
+            elif intent.action in (IntentAction.RESOLVE, IntentAction.EXPIRE):
+                target = self._intent_target(states, intent)
+                if target is None:
+                    continue
+                to_status = (
+                    StateStatus.RESOLVED
+                    if intent.action == IntentAction.RESOLVE
+                    else StateStatus.EXPIRED
+                )
+                if self._mutate(target, obs, status=to_status, reason=intent.reason):
+                    changed.append(target)
+            else:  # pragma: no cover — future actions
+                logger.warning("unknown intent action %r ignored", intent.action)
+        return changed
+
+    def _intent_target(
+        self, states: List[State], intent: TransitionIntent
+    ) -> Optional[State]:
+        if intent.target_state_id:
+            for s in states:
+                if s.state_id == intent.target_state_id:
+                    return s
+            return None
+        for s in states:
+            if s.category == intent.target_category and s.key == intent.target_key:
+                return s
+        return None
+
+    def _touch(self, state: State, obs: Observation) -> bool:
+        """Refresh a state's confirmation time without a transition row.
+        Applies the same staleness/replay guards as _mutate; refuses when a
+        different observation at the same-or-later time owns the state."""
+        obs_key = self._obs_key(obs)
+        if obs_key and state.last_observation_key == obs_key:
+            return False
+        if obs.is_replay and obs.observed_at <= state.last_observed_at:
+            return False
+        if obs.observed_at < state.last_observed_at:
+            return False
+        state.last_observed_at = obs.observed_at
+        state.last_observation_key = obs_key
+        state.updated_at = self._now()
+        self.store.insert_state(state)
+        return True
 
     def _replay_blocked_by_latest(self, obs: Observation, key: str) -> bool:
         """Replay-mode guard for creation branches: if ANY state with this
@@ -301,10 +419,13 @@ class Reconciler:
         awake = self._latest_for_key(states, "sleep", "awake")
         if awake is not None:
             if obs.observed_at >= awake.last_observed_at:
-                # new wake event: refresh valid_from (keep original history)
+                # new EXPLICIT wake event: refresh valid_from (user now
+                # claims the wake time) and upgrade any interaction-confirmed
+                # marker back to an explicit wake (V2 §12 / V2-T6)
                 if self._mutate(
                     awake, obs,
                     status=StateStatus.ACTIVE,
+                    value="awake",
                     valid_from=obs.observed_at,
                     reason="R1 awake re-affirmed",
                 ):

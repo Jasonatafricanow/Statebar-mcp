@@ -35,9 +35,13 @@ from .extractor.fast_overlay import FastOverlayExtractor
 from .extractor.persistent import PersistentExtractor
 from .lifecycle import lazy_expire
 from .models import (
+    Certainty,
     ObserveRequest,
     Observation,
+    ObservationType,
     Snapshot,
+    Source,
+    SourceType,
     State,
     StateStatus,
     utc_now,
@@ -111,6 +115,12 @@ class UserStateService:
         sync_obs = self.fast_extractor.extract(
             subject_id, event_id, request.text, request.source, request.observed_at
         )
+        # V2 first-class signal: the user's real-time interaction itself is
+        # evidence (observed, confidence 1.0), independent of the message's
+        # language. Assistant questions never produce it (V2-T4), and diary
+        # writes are not real-time interactions.
+        if request.source.type == SourceType.CONVERSATION and sync_obs is not None:
+            sync_obs = list(sync_obs) + [self._interaction_observation(request, len(sync_obs))]
         # leftovers = persisted-but-unreconciled rows from a crashed earlier
         # attempt; they are replayed with STRICT conflict rules (is_replay).
         leftovers = self.store.get_unreconciled_observations(subject_id, event_id)
@@ -148,6 +158,29 @@ class UserStateService:
         return result
 
     # -- worker (single thread, bounded lifecycle) -----------------------------
+
+    def _interaction_observation(self, request: ObserveRequest, index: int) -> Observation:
+        """V2 §4.1/§6: the user's real-time interaction is itself evidence —
+        deterministic, no LLM, certainty=observed, confidence=1.0."""
+        return Observation(
+            subject_id=request.subject_id,
+            event_id=request.event_id,
+            observation_index=index,
+            type=ObservationType.ACTIVITY,
+            category="presence",
+            key="interactive_activity",
+            value="true",
+            certainty=Certainty.OBSERVED,
+            source=Source(
+                type=SourceType.INTERACTION,
+                platform=request.source.platform,
+                session_id=request.source.session_id,
+                message_id=request.source.message_id,
+            ),
+            observed_at=request.observed_at,
+            confidence=1.0,
+            raw_payload="",
+        )
 
     def _mark_in_flight(self, subject_id: str, event_id: str) -> bool:
         key = (subject_id, event_id)

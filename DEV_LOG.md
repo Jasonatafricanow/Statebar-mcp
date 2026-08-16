@@ -107,6 +107,27 @@
 4. 测试 80 → **82 passed**（6 连跑全绿）。
 5. 推送 `v0.1.0-rc1` 标签触发 CI（workflow 对 `v*` 标签触发）。
 
+## 2026-08-16 · V2 第一阶段：证据驱动状态引擎（垂直切片）
+
+按《Statebar V2 证据驱动状态引擎重构 Spec》§20 实施，**不重写 V1，只加一条完整垂直切片**：
+
+- `core/ontology.py`（新）：INCOMPATIBLE 本体关系（phase 1: awake↔sleeping）、
+  证据规则（interactive_activity → 强 awake 证据）、声明式生命周期
+- `core/inference.py`（新）：InferenceEngine（无副作用纯函数）——
+  Observation + State + Ontology → TransitionIntent[]；
+  **证据优先级**：显式语言 ≥ 行为推断（同秒"我睡了"不被 interaction 唤醒）
+- `core/models.py`：Certainty.observed、SourceType.interaction/system、
+  TransitionIntent（ESTABLISH/UPDATE/SUPERSEDE/RESOLVE/EXPIRE/NOOP，非 LLM 输出契约）
+- `core/service.py`：observe 同步路径自动生成 `interactive_activity` Observation
+  （conversation 源、非 assistant；diary 不算实时交互）
+- `core/reconciler.py`：apply() 先走 Inference→Intent，未接管的 observation 回退
+  V1 规则（R1-R10 保留，V2 §14 迁移策略）；Intent 执行带全部安全门
+  （stale/replay/幂等/transition 历史/事务）；UPDATE 无实质变化时只 touch 确认时间
+- `core/snapshot.py`：awake_confirmed → "awake confirmed at ~HH:MM"（不虚构 wake time）；
+  显式"我刚睡醒"升级为 "awake since ~HH:MM"
+- `tests/test_v2.py`：**V2-T1..T8 全部通过** + 证据优先级测试；全套 **91 passed ×4 连跑**
+  （V1 的 D1-D12/安全/MCP stdio 全部保持绿 = V2-T8 外部 Contract 兼容的证据）
+
 ### 待办
 - [ ] 首个 PyPI 发布（0.1.0，发布后 README 的 pip install 生效）
 - [ ] 确认仓库 Actions 已启用（本地无法访问 GitHub API；工作流文件已在 master 树中，可手动 dispatch）

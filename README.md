@@ -180,6 +180,32 @@ statebar_mcp/
 └── cli.py                   statebar-mcp mcp | serve | health
 ```
 
+### V2：证据驱动状态引擎（第一阶段已落地）
+
+Statebar 不只是"理解用户说了什么"，而是**根据持续获得的证据维护对用户状态的最佳认知**：
+
+```
+Signal（interaction / language / device / diary / derived / system）
+  → Observation（统一证据层）
+  → Inference Engine（Ontology + Evidence Policy）
+  → TransitionIntent（ESTABLISH/UPDATE/SUPERSEDE/...，非 LLM 输出契约）
+  → Reconciler（唯一 Canonical State 写入门）
+  → Canonical State
+```
+
+**第一阶段垂直切片（已交付）**：用户实时交互本身是一等证据——
+`interactive_activity` Observation（certainty=observed，confidence=1.0，无需分析文本）。
+`sleeping = active` 时，用户发任意消息（"背有点僵"/"哈哈"/"股票怎么回事"）都会
+基于本体关系 `INCOMPATIBLE(awake, sleeping)` 推断清醒：supersede sleeping、
+建立 awake（只表达"awake confirmed at ~14:37"，**不虚构 wake time**——V2-T6）。
+
+关键边界（均有测试，`tests/test_v2.py` V2-T1..T8）：
+- **证据优先级**：显式语言 > 行为推断——"我睡了"当轮不会因 interaction 被立刻唤醒
+- 延迟消息（observed_at 早于睡眠建立时间）不会推翻新睡眠状态
+- Assistant 自己的消息不产生 interaction 证据
+- 显式"我刚睡醒"路径不变，且会把 confirmed 升级为真实 wake time
+- **外部 Contract 完全不变**（V1 的 MCP/REST/Adapter 无需改动）
+
 ### 冻结语义速览
 
 - **状态作用域 = subject_id**（跨平台共享；provenance 保留但不按 platform 隔离）
