@@ -17,6 +17,69 @@ User State Layer（刚睡醒 / 胃疼 / 今天游泳了 / 下午可能写书法�
 
 ---
 
+## 产品介绍
+
+### 解决什么痛点
+
+**痛点 1：Agent 没有"短期状态记忆"，每轮都在裸奔**
+长期 Memory 只适合存稳定事实（"用户是开发者"），不适合存临时状态（"刚睡醒 / 胃疼 / 下午可能去游泳"）。没有状态层时，Agent 每轮对话都要从零推断用户状态——推断错就翻车。经典案例：用户凌晨说"我刚睡醒"，Agent 还在催"这么晚该睡了"。
+
+**痛点 2：状态跨会话、跨平台丢失**
+用户在微信说"胃疼"，切到 Telegram 问天气——Agent 完全不知道胃疼这件事，聊天体验支离破碎。状态应该跟着**人**走，不是跟着**会话**走。
+
+**痛点 3：上下文膨胀与污染**
+把全部状态塞进 prompt 会膨胀且过时；更危险的是 Agent 自己猜的"事实"被写回记忆再注入自己，形成**自污染闭环**（AI 猜测 → 写入 → 注入 → 更确信猜测）。
+
+**痛点 4：部署门槛杀死开源分发**
+传统方案要用户自己常驻 daemon、配端口/token/systemd——开源项目一碰这个门槛就没人用。
+
+### 满足什么需求
+
+| 需求 | 实现 |
+|---|---|
+| Agent 每轮**确定性地**知道用户当前状态 | `snapshot` 每轮注入（固定底座 5-8 条 + query 增量 0-3 条，100-300 tokens） |
+| 用户随口一句话就能更新状态 | `observe` 自然语言抽取（规则即时 + LLM 持久，双路径） |
+| 状态有生命周期，不会永远挂着 | 语义窗口（下午=13:00-17:00）+ 惰性过期 + 显式取消/解决 |
+| 区分"我打算去"和"我可能去" | certainty ∈ confirmed/planned/tentative/estimated/inferred |
+| 跨微信/Telegram/飞书共享状态 | `subject_id` 作用域 + provenance 保留，不按平台隔离 |
+| 不会重复处理同一条消息 | 两级幂等（event_id + observation_index） |
+| 主动关心有素材 | `context_candidates`（recent / unresolved / interesting / planned） |
+| 任何人能装、不用 daemon | MCP stdio：Client 拉起子进程、退出即消失、SQLite 持久化 |
+| 免费档模型也能用 | 抽取器模型可配置；未配置 LLM 时规则路径照常工作 |
+
+### 能完成什么功能
+
+- **observe**：喂自然语言（"我刚睡醒"、"胃好多了"、"下午可能去写书法"、"不去了"）→ 自动抽取成结构化 Observation → 确定性 Reconciler 更新 Canonical State
+- **snapshot**：每轮生成当前状态快照注入 Agent 上下文（自动淘汰过期状态、按 query 追加相关项）
+- **context_candidates**：给主动性系统提供聊天素材（未闭环事件、最近事件、有趣事件）
+- **get_state**：查询完整状态（调试 / 分析 / 校验）
+- **确定性规则引擎**：R1-R10 业务规则 + S1-S2 系统规则（防自污染、保留历史）
+- **多 transport**：MCP stdio（默认，零依赖）/ REST serve（多端共享）
+
+### 典型使用场景
+
+```
+场景 1：凌晨刚醒
+用户：我刚睡醒
+Agent（当前轮）：难得睡到自然醒？睡够了没？   ← 不催睡（红线守住）
+
+场景 2：跨平台状态
+微信 14:00：胃有点疼
+Telegram 16:00：好点了吗？                      ← 状态跟着人走
+
+场景 3：计划管理
+用户：下午可能去写书法
+Agent（17:30 后）：不再问"还去写书法吗"        ← 语义过期
+用户：不去了
+Agent：好，那改天                        ← 显式取消
+
+场景 4：主动关心素材
+用户 14:00：胃疼（unresolved）
+心潮达到主动阈值 → 读 context_candidates → "胃现在好点了吗？"
+```
+
+---
+
 ## 快速开始
 
 ```bash
@@ -126,6 +189,21 @@ dsh_user_state/
 
 未配置 LLM 时：同步 Fast Overlay 路径照常工作（刚醒/睡了/取消/症状/好多了/吃药），
 Persistent 异步路径优雅禁用。
+
+## 深度接入：确定性 Adapter（推荐给框架开发者）
+
+普通 MCP 接入时，是否调用 `snapshot` 取决于 Host/模型自己（可能不调用）。
+若需要**每轮 100% 确定性挂载**（如 Hermes），用深度 Adapter：
+
+```
+prefetch(current_user_message)
+  1. observe(current_user_message)     ← 先喂（observe-before-snapshot）
+  2. snapshot(query=current_user_message)
+  3. 注入 Context
+```
+
+Hermes 侧参考实现：`C:\projects\hermes-user-state-adapter`（私有，MCP client SDK
+编程式调用，模型无选择权）。
 
 ## 开发与验收
 
