@@ -4,6 +4,13 @@
 
 ## 2026-08-16 · 派单 A 主体完成（D1-D12 全通过）
 
+### 上线记录（同日）
+- 生产 serve 常驻：`C:\Python314\python.exe -m dsh_user_state serve --port 8765 --log-file ...`（PID 10520）
+- 生产配置 `~/.dsh-user-state/config.json`：DB=`profiles/xiyue/state/user_state.db`；
+  抽取器=Gemini OpenAI 兼容端点（gemini-3.1-flash-lite）
+- 真实 LLM 抽取实测：'下午可能去写书法' → tentative plan + afternoon 窗口 ✓
+- 派单 B 上线后：serve 收到溪月网关真实 observe 流量，awake 状态入生产库 ✓
+
 ### 完成内容
 - 仓库骨架：`pyproject.toml`（零依赖 core；`[dev]`=pytest、`[mcp]`=官方 SDK 仅测试用）、`dsh_user_state/` 包、`tests/`
 - `core/`：
