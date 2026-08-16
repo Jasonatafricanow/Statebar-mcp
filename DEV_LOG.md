@@ -74,6 +74,24 @@
 6. 测试从 74 → **78 passed**（新增：中文 stdio 无 PYTHONUTF8、崩溃窗口恢复、close 在途/丢弃语义、
    create_server fail-closed）；CI 增加 `workflow_dispatch` 与 tag 触发。
 
+### 复评第三轮（P1 原子性 + P2 有界排空）
+
+1. **[P1] reconcile 与 reconciled 标记同一事务**：store 增加可嵌套 `transaction()`
+   （BEGIN IMMEDIATE + 深度计数，所有写方法在事务内推迟 commit）；observe 同步路径
+   与异步 worker 把「observation 插入 + state/transition 写入 + reconciled 标记 +
+   事件状态」放进**单次 commit**——崩溃要么全有要么全无，重放不可能双写。
+2. **[P1] observation 级幂等键**（双保险，兼治旧版本遗留的崩溃窗口）：
+   states 表新增 `last_observation_key`（`<event_id>:<observation_index>`），
+   `_mutate/_supersede` 对同一 observation 的重放直接 no-op；
+   `_is_stale_creation` 同样拦截，覆盖创建路径。评审复现（1→2 条 transition）
+   已固化为 `test_replay_after_reconcile_before_mark_is_idempotent`。
+3. **[P2] 拒绝路径有界排空**：`_drain_request_body` 每次读取受 `drain_timeout`(0.5s)
+   套接字超时约束；所有连接在 `setup()` 统一设 `request_timeout`(10s)。
+   新增 `test_incomplete_body_401_is_bounded`（声明 Content-Length 不发正文，
+   401 必须在 3s 内返回）。
+4. 测试 78 → **80 passed**（6 连跑全绿）；test_unit 的 obs() 助手改为唯一
+   event_id（幂等键在现实中以 UNIQUE(event_id,index) 为前提）。
+
 ### 待办
 - [ ] 首个 PyPI 发布（0.1.0，发布后 README 的 pip install 生效）
 - [ ] 确认仓库 Actions 已启用（本地无法访问 GitHub API；工作流文件已在 master 树中，可手动 dispatch）
