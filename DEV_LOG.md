@@ -134,6 +134,67 @@
 - [ ] mcp_http.py（Streamable HTTP，可选 transport，§5 标为可选；Phase 1 已交付 stdio+serve）
 - [ ] 示例 adapter、开源社区收尾
 
+## 2026-08-17 · 复评第五轮：P1/P2 修复 + P3 补测试
+
+复评结论（11ce80b）：V2 基础行为成立、核心 91 项通过，但仍有 2 个 P1、3 个 P2。
+本轮逐项修复并补测试（全套 108 passed，测试基数为 91 + 新增 17）：
+
+1. **[P1] reconcile() 公开入口半提交**：`service.reconcile()`（transports 直接携带
+   Observation 的入口）改为 `with store.transaction():` 包裹 —— state、transition、
+   tombstone 同一事务原子提交。复评故障注入结果（首败后 state=1/transition=0、
+   重试只补 tombstone、transition 永久丢失）固化为
+   `TestReconcileTransactionAtomicity`：transition 写入失败 → 全部回滚（无半提交
+   state、无 tombstone），重试完整恢复（1 state + 1 transition + tombstone）。
+2. **[P1] V2 Inference 绕过 S1**：`is_interaction_observation()` 增加受信来源校验
+   （`source.type == interaction`）；同时把 S1 门从 V1 handler 前移到
+   `reconciler.apply()` 入口 —— 无论 V1 规则还是 V2 inference 接管，"助手内容
+   永不创建用户状态" 现在是全入口边界。复评构造（assistant_question 来源的
+   interactive_activity/observed）固化为回归测试，同形 conversation 来源同样被拒。
+3. **[P2] transition legality gate 未接线**：`ontology.validate_transition()` 接入
+   `_execute_intents` —— SUPERSEDE / 状态变更 UPDATE / RESOLVE / EXPIRE 写入前统一
+   校验，非法跳转（如复评注入的 sleep ACTIVE→RESOLVED）整条 intent 拒绝、状态与
+   历史均不动；PLAN_LIFECYCLE 补 SUPERSEDED（reschedule 语义）。附拒绝 + 合法
+   生命周期放行测试。
+4. **[P2] intent evidence 未持久化**：`TransitionIntent.evidence` 现在被消费 ——
+   `_transition` 把 evidence 键（`<event_id>:<index>`）解析为 observations 表真实
+   行 ID 写入 `source_observation_id`（V1 路径也一并获得血缘）。T3 升级为血缘断言：
+   supersede transition 的 `source_observation_id` 必须等于 evidence observation 行 ID。
+5. **[P2] Adapter 验收时钟失配**（hermes-user-state-adapter 仓库）：Provider 增加
+   可注入时钟，测试统一冻结 observed_at（详见该仓库 DEV_LOG）。
+6. **[P3] 补测试**：反向场景（awake→sleeping supersede 仍由 V1 R1/R2 管，reason
+   含 R2 证明 V1 所有权）与混合场景（sleeping + interaction 同秒，显式语言 ≥ 行为
+   推断，不建 awake）。
+
+## 2026-08-17 · V2 第二阶段迁移：R3-R5/R6-R8 → ontology 驱动 inference
+
+按《Statebar V2 证据驱动状态引擎重构 Spec》§22 迁移方法逐个落地
+（ontology 声明 → inference handler → 删 V1 规则 → 全套测试绿）：
+
+- `models.TransitionIntent` 扩展语义窗口字段（valid_from/valid_until/relevant_until、
+  followup_relevant 三态）——ESTABLISH/UPDATE 由 inference 显式携带窗口，
+  reconciler 只负责校验与执行
+- **plan 切片（PLAN_LIFECYCLE）**：`plan/cancel` observation 由 inference 接管；
+  activity 观察的部分所有权（有活跃 plan 目标 → completed intent，否则回退 V1 R4
+  活动态）；R6 reschedule 改为 [ESTABLISH 新窗口, SUPERSEDE 旧 episode] 顺序，
+  规避幂等守卫误杀同 observation 的新 episode；R9 显式确认升级同键推断态并入
+  inference。删除 V1 的 `_r3_cancel/_r5_confirm/_r6_reschedule/_r_plan_new/
+  _create_plan_state` 与 R4 的 plan 分支
+- **symptom 切片（SYMPTOM_LIFECYCLE）**：`symptom/resolve` observation 由
+  inference 接管 —— ESTABLISH(active, followup) / UPDATE(improving/resolved,
+  re-affirm) / 新 episode。删除 V1 的 `_r_symptom_new/_r7_improving/_r8_resolved/
+  _resolve_handler`
+- 新增语义测试不需要加规则代码：迁移验收测试直接断言 inference 所有权、生命周期
+  链、V1 处理器已删除（`_RULE_HANDLERS` 无 plan/cancel/symptom/resolve）
+
+### 迁移后 V1 规则现状（下一轮继续）
+- 剩余 V1：R1/R2（显式睡眠/清醒语言，interaction 切片只管行为推断）、R4 活动态
+  （activity states）、R9（跨类型显式 supersede 推断）、R10（lazy_expire 保留）、
+  S1/S2 系统规则
+- 全套 **109 项测试 = 91 基线 + 18 新增**（复评回归 5：TrustBoundary 3 +
+  LegalityGate 2；P3 2；迁移验收 9：plans 5 + symptoms 4；事务原子性 2）；
+  本机 108 passed，另 1 项 MCP SDK 子进程互操作测试受本机沙箱命名管道限制
+  无法运行（常规环境通过）
+
 ## 派单总纲关键约束索引（实现自查）
 - §6 五 API 语义冻结 → transports/contract.py
 - §6.1 observe 输入（subject_id/event_id/source/text/observed_at）→ models.ObserveRequest
