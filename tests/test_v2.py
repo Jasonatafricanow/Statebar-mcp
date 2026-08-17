@@ -439,3 +439,63 @@ class TestV2TransitionLegalityGate:
             status=StateStatus.ACTIVE,
         )
         assert ontology.validate_transition(sleeping, StateStatus.SUPERSEDED)
+
+
+class TestV2V1Coexistence:
+    """P3: V2 inference and the V1 rule handlers must coexist during the
+    migration — the direction V2 does NOT (yet) own stays V1's."""
+
+    def test_reverse_awake_to_sleeping_still_v1(self):
+        """awake→sleeping supersede stays under V1 R1/R2: explicit sleep
+        language supersedes the current awake (history kept) and V2
+        inference must not interfere."""
+        service, store = make_service()
+        try:
+            t1 = datetime.now(timezone.utc)
+            t2 = t1 + timedelta(minutes=30)
+            observe(service, "u", "e1", "我刚睡醒", t1)
+            awake = store.get_state("u", "sleep", "awake")
+            assert awake is not None and awake.status == "active"
+
+            observe(service, "u", "e2", "我睡了", t2)
+            awake = store.get_state("u", "sleep", "awake")
+            sleeping = store.get_state("u", "sleep", "sleeping")
+            assert awake.status == StateStatus.SUPERSEDED
+            assert sleeping is not None and sleeping.status == "active"
+            # V1 ownership proof: the supersede reason is R2's, and the wake
+            # history (valid_from) was NOT rewritten
+            transitions = store.get_transitions(awake.state_id)
+            supersede = [t for t in transitions if t.to_status == StateStatus.SUPERSEDED]
+            assert len(supersede) == 1
+            assert "R2" in supersede[0].reason, (
+                "awake→sleeping supersede left V1 R2: %r" % supersede[0].reason
+            )
+            # the "我睡了" turn also carried an interaction observation — it
+            # must NOT have woken the user back up
+            assert store.get_state("u", "sleep", "sleeping").status == "active"
+        finally:
+            service.close()
+
+    def test_sleeping_plus_interaction_same_second(self):
+        """P3 mixed scenario: '睡了一半发消息' — an explicit sleep claim at
+        second T and a message with an interaction observation at the SAME
+        second T. Evidence precedence (explicit ≥ behavioral, same semantic
+        time) must keep sleeping active and create no awake."""
+        service, store = make_service()
+        try:
+            t = datetime.now(timezone.utc)
+            observe(service, "u", "e1", "我睡了", t)
+            sleeping = store.get_state("u", "sleep", "sleeping")
+            assert sleeping.status == "active"
+
+            # message at the exact same observed_at (different event)
+            observe(service, "u", "e2", "背有点僵", t)
+
+            sleeping = store.get_state("u", "sleep", "sleeping")
+            assert sleeping.status == "active", (
+                "same-second interaction superseded the explicit sleep claim"
+            )
+            awake = store.get_state("u", "sleep", "awake")
+            assert awake is None, "same-second interaction established awake"
+        finally:
+            service.close()
