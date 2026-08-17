@@ -18,7 +18,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -38,7 +38,11 @@ from statebar_mcp.core.extractor.persistent import (  # noqa: E402
     OpenAICompatExtractor,
     PersistentExtractor,
 )
-from statebar_mcp.core.models import ObserveRequest, Source  # noqa: E402
+from statebar_mcp.core.models import (  # noqa: E402
+    Observation,
+    ObserveRequest,
+    Source,
+)
 from statebar_mcp.core.service import UserStateService  # noqa: E402
 from statebar_mcp.core.store import SQLiteStore  # noqa: E402
 from statebar_mcp.transports.rest import create_server  # noqa: E402
@@ -262,6 +266,112 @@ class TestEventRecovery:
             assert store.get_event("u", "e1")["status"] == "complete"
             assert store.get_state("u", "sleep", "awake").status == "active"
         finally:
+            service.close()
+
+
+class TestReconcileTransactionAtomicity:
+    """P1: the public reconcile() entry wraps state + transition + tombstone
+    in ONE store transaction. The reviewer's fault injection showed the old
+    entry half-committing (state=1, transition=0, tombstone=true after retry
+    → the transition was lost forever and S2 was broken)."""
+
+    def test_transition_failure_rolls_back_everything_then_retry_recovers(self):
+        store = SQLiteStore(":memory:")
+        service = UserStateService(store, persistent_extractor=MockExtractor())
+        now = datetime.now(timezone.utc)
+        obs = Observation(
+            subject_id="u",
+            event_id="e1",
+            observation_index=0,
+            type="awake",
+            category="sleep",
+            key="awake",
+            value="awake",
+            source=Source(type="conversation"),
+            observed_at=now,
+            raw_payload="我刚睡醒",
+        )
+        orig_record_transition = store.record_transition
+
+        def failing_record_transition(transition):
+            raise RuntimeError("simulated transition write failure (disk full)")
+
+        try:
+            store.record_transition = failing_record_transition  # type: ignore[method-assign]
+            with pytest.raises(RuntimeError, match="disk full"):
+                service.reconcile(obs)
+
+            # The FIRST failure must leave NOTHING behind: no half-committed
+            # state, no tombstone that would make the retry skip this
+            # observation.
+            assert store.counts()["states"] == 0, "state half-committed"
+            assert store.counts()["state_transitions"] == 0
+            assert not store.is_observation_applied("u", "e1", 0), (
+                "tombstone written although the observation was rolled back"
+            )
+
+            # The retry (writer healthy again) must recover completely:
+            # state + transition + tombstone all present, exactly once.
+            store.record_transition = orig_record_transition  # type: ignore[method-assign]
+            service.reconcile(obs)
+            awake = store.get_state("u", "sleep", "awake")
+            assert awake is not None and awake.status == "active"
+            transitions = store.get_transitions(awake.state_id)
+            assert len(transitions) == 1, "retry lost or duplicated the transition"
+            assert store.is_observation_applied("u", "e1", 0)
+        finally:
+            store.record_transition = orig_record_transition  # type: ignore[method-assign]
+            service.close()
+
+    def test_reconcile_supersede_failure_keeps_pair_consistent(self):
+        """The same atomicity must hold for the supersede path: sleeping →
+        superseded writes one state row AND one transition row; a transition
+        failure must roll the superseded status back too."""
+        store = SQLiteStore(":memory:")
+        service = UserStateService(store, persistent_extractor=MockExtractor())
+        now = datetime.now(timezone.utc)
+        sleep_obs = Observation(
+            subject_id="u", event_id="e1", type="sleep",
+            category="sleep", key="sleeping", value="sleeping",
+            source=Source(type="conversation"), observed_at=now,
+            raw_payload="我睡了",
+        )
+        wake_obs = Observation(
+            subject_id="u", event_id="e2", type="awake",
+            category="sleep", key="awake", value="awake",
+            source=Source(type="conversation"),
+            observed_at=now + timedelta(minutes=1),
+            raw_payload="我刚睡醒",
+        )
+        orig_record_transition = store.record_transition
+        try:
+            service.reconcile(sleep_obs)
+            sleeping = store.get_state("u", "sleep", "sleeping")
+            assert sleeping.status == "active"
+
+            def failing_record_transition(transition):
+                raise RuntimeError("simulated transition write failure")
+
+            store.record_transition = failing_record_transition  # type: ignore[method-assign]
+            with pytest.raises(RuntimeError):
+                service.reconcile(wake_obs)
+
+            # rollback: sleeping is still ACTIVE (its supersede was undone)
+            sleeping = store.get_state("u", "sleep", "sleeping")
+            assert sleeping.status == "active", "superseded status half-committed"
+            assert store.get_state("u", "sleep", "awake") is None
+
+            store.record_transition = orig_record_transition  # type: ignore[method-assign]
+            service.reconcile(wake_obs)
+            sleeping = store.get_state("u", "sleep", "sleeping")
+            assert sleeping.status == "superseded"
+            awake = store.get_state("u", "sleep", "awake")
+            assert awake is not None and awake.status == "active"
+            # create + supersede for sleeping, create for awake
+            assert len(store.get_transitions(sleeping.state_id)) == 2
+            assert len(store.get_transitions(awake.state_id)) == 1
+        finally:
+            store.record_transition = orig_record_transition  # type: ignore[method-assign]
             service.close()
 
 

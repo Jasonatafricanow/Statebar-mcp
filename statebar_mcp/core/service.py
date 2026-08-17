@@ -267,8 +267,16 @@ class UserStateService:
         return changed
 
     def reconcile(self, observation: Observation) -> List[State]:
-        """Exposed for transports that already carry validated Observations."""
-        return self.reconciler.apply(observation)
+        """Exposed for transports that already carry validated Observations.
+
+        Wraps the reconciler in ONE store transaction: state rows, transition
+        rows and the applied-observation tombstone commit atomically. When any
+        write fails (e.g. the transition insert), the whole observation is
+        rolled back — a retry re-applies it cleanly instead of permanently
+        losing the transition (S2: state and history can never diverge).
+        """
+        with self.store.transaction():
+            return self.reconciler.apply(observation)
 
     # ----------------------------------------------------------------- snapshot
 
