@@ -126,7 +126,9 @@ class TestV2InteractionSlice:
 
     def test_T3_transition_traceability(self):
         """The history must trace: interaction observation → awake inference
-        → sleeping superseded."""
+        → sleeping superseded — including the persisted data lineage: the
+        supersede transition row must point at the evidence observation's
+        real row id (not just coexist with it)."""
         service, store = make_service()
         t1 = datetime.now(timezone.utc)
         t2 = t1 + timedelta(minutes=10)
@@ -148,6 +150,15 @@ class TestV2InteractionSlice:
             assert store.is_observation_applied(
                 "u", "e2", interactions[0].observation_index
             ), "interaction observation tombstone missing"
+            # P2 data lineage: the transition must point at the REAL
+            # evidence row — traceable from state change back to evidence
+            evidence_id = store.get_observation_id(
+                "u", "e2", interactions[0].observation_index
+            )
+            assert evidence_id is not None
+            assert supersede[0].source_observation_id == evidence_id, (
+                "supersede transition lost its evidence lineage"
+            )
         finally:
             service.close()
 

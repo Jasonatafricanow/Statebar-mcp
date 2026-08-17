@@ -371,6 +371,19 @@ class SQLiteStore:
             ).fetchall()
         return [self._obs_from_row(dict(r)) for r in rows]
 
+    def get_observation_id(
+        self, subject_id: str, event_id: str, observation_index: int
+    ) -> Optional[int]:
+        """Resolve the persisted observations.id for an evidence key
+        (subject/event/index). Returns None when the row does not exist."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id FROM observations "
+                "WHERE subject_id=? AND event_id=? AND observation_index=?",
+                (subject_id, event_id, observation_index),
+            ).fetchone()
+        return int(row["id"]) if row else None
+
     @staticmethod
     def _obs_from_row(row: Dict[str, Any]) -> Observation:
         return Observation(

@@ -133,16 +133,46 @@ class Reconciler:
         )
 
     def _transition(self, state: State, to_status: str, reason: str,
-                    obs: Optional[Observation]) -> StateTransition:
+                    obs: Optional[Observation],
+                    evidence: Optional[List[str]] = None) -> StateTransition:
         return StateTransition(
             state_id=state.state_id,
             subject_id=state.subject_id,
             from_status=state.status,
             to_status=to_status,
             reason=reason,
-            source_observation_id=None,
+            source_observation_id=self._resolve_source_observation(
+                state, obs, evidence
+            ),
             created_at=self._now(),
         )
+
+    def _resolve_source_observation(
+        self,
+        state: State,
+        obs: Optional[Observation],
+        evidence: Optional[List[str]] = None,
+    ) -> Optional[int]:
+        """Data lineage (S2): point the transition at the persisted
+        observation row that caused it. Intent evidence keys come first,
+        then the triggering observation itself. Returns the real
+        observations.id of the first key that resolves, else None."""
+        keys = list(evidence or [])
+        if obs is not None:
+            keys.append(self._obs_key(obs))
+        for key in keys:
+            if not key or ":" not in key:
+                continue
+            event_id, _, index = key.rpartition(":")
+            try:
+                oid = self.store.get_observation_id(
+                    state.subject_id, event_id, int(index)
+                )
+            except ValueError:
+                continue
+            if oid is not None:
+                return oid
+        return None
 
     def _apply(self, state: State, transition: StateTransition) -> None:
         """Persist a mutation: state row + transition row (S2)."""
@@ -162,6 +192,7 @@ class Reconciler:
         relevant_until: Optional[datetime] = None,
         followup_relevant: Optional[bool] = None,
         reason: str,
+        evidence: Optional[List[str]] = None,
     ) -> bool:
         """In-place update with transition history. Refuses when the
         observation is older than the state's last SEMANTIC change (D12
@@ -190,7 +221,9 @@ class Reconciler:
                 obs.type, obs.observed_at.isoformat(), state.last_observed_at.isoformat(),
             )
             return False
-        transition = self._transition(state, status or state.status, reason, obs)
+        transition = self._transition(
+            state, status or state.status, reason, obs, evidence
+        )
         if status is not None:
             state.status = status
         if value is not None:
@@ -211,7 +244,8 @@ class Reconciler:
         self._apply(state, transition)
         return True
 
-    def _supersede(self, state: State, obs: Optional[Observation], reason: str) -> bool:
+    def _supersede(self, state: State, obs: Optional[Observation], reason: str,
+                   evidence: Optional[List[str]] = None) -> bool:
         """Mark a state superseded. Refuses when the observation is older
         than the state's last semantic change (D12: no rollbacks) or when
         this exact observation was already applied (replay idempotency)."""
@@ -228,7 +262,9 @@ class Reconciler:
                 obs.observed_at.isoformat(), state.last_observed_at.isoformat(),
             )
             return False
-        transition = self._transition(state, StateStatus.SUPERSEDED, reason, obs)
+        transition = self._transition(
+            state, StateStatus.SUPERSEDED, reason, obs, evidence
+        )
         state.status = StateStatus.SUPERSEDED
         state.updated_at = self._now()
         state.last_observed_at = obs.observed_at if obs is not None else state.last_observed_at
@@ -300,7 +336,7 @@ class Reconciler:
                 # whole — the intent is dropped, the state is untouched.
                 if not self._legal_transition(target, StateStatus.SUPERSEDED, intent):
                     continue
-                if self._supersede(target, obs, intent.reason):
+                if self._supersede(target, obs, intent.reason, evidence=intent.evidence):
                     changed.append(target)
             elif intent.action == IntentAction.ESTABLISH:
                 if self._is_stale_creation(obs, states, intent.key):
@@ -317,7 +353,9 @@ class Reconciler:
                 )
                 self._apply(
                     new,
-                    self._transition(new, new.status, intent.reason, obs),
+                    self._transition(
+                        new, new.status, intent.reason, obs, intent.evidence
+                    ),
                 )
                 changed.append(new)
             elif intent.action == IntentAction.UPDATE:
@@ -341,6 +379,7 @@ class Reconciler:
                         value=intent.value or None,
                         certainty=intent.certainty or None,
                         reason=intent.reason,
+                        evidence=intent.evidence,
                     ):
                         changed.append(target)
                 else:
@@ -360,7 +399,10 @@ class Reconciler:
                 )
                 if not self._legal_transition(target, to_status, intent):
                     continue
-                if self._mutate(target, obs, status=to_status, reason=intent.reason):
+                if self._mutate(
+                    target, obs, status=to_status, reason=intent.reason,
+                    evidence=intent.evidence,
+                ):
                     changed.append(target)
             else:  # pragma: no cover — future actions
                 logger.warning("unknown intent action %r ignored", intent.action)
