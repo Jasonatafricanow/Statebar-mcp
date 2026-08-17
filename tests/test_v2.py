@@ -629,3 +629,104 @@ class TestV2MigrationPlans:
                      "_r_plan_new", "_create_plan_state", "_plans",
                      "_target_plan"):
             assert not hasattr(rec, name), f"V1 plan handler {name} still present"
+
+
+class TestV2MigrationSymptoms:
+    """R6-R8 migration (SYMPTOM_LIFECYCLE): symptom observations are now
+    owned by the Inference Engine; the V1 symptom handlers are gone."""
+
+    def _clock(self):
+        return FixedClock(local_dt(2026, 8, 16, 9, 0).astimezone(timezone.utc))
+
+    def _symptom_obs(self, key="stomach_pain", value="active",
+                     obs_type="symptom", observed=None, event_id="e1"):
+        return Observation(
+            subject_id="u", event_id=event_id, type=obs_type,
+            category="health", key=key, value=value,
+            source=Source(type="conversation"),
+            observed_at=observed or datetime.now(timezone.utc),
+            raw_payload="胃有点疼",
+        )
+
+    def test_inference_owns_symptom_observations(self):
+        from statebar_mcp.core.inference import InferenceEngine
+
+        clock = self._clock()
+        engine = InferenceEngine(now_fn=clock)
+        intents, handled = engine.infer(self._symptom_obs(observed=clock()), [])
+        assert handled is True, "symptom observation must be owned by inference"
+        assert len(intents) == 1
+        assert intents[0].action == "ESTABLISH"
+        assert intents[0].category == "health"
+        assert intents[0].status == StateStatus.ACTIVE
+        assert intents[0].followup_relevant is True
+
+    def test_symptom_lifecycle_chain_end_to_end(self):
+        """active → improving → resolved, all through inference intents with
+        SYMPTOM_LIFECYCLE-legal hops and persisted transitions."""
+        clock = self._clock()
+        service, store = make_service(clock=clock)
+        try:
+            rec = service.reconciler
+            rec.apply(self._symptom_obs(observed=clock(), event_id="e1"))
+            symptom = store.get_state("u", "health", "stomach_pain")
+            assert symptom.status == StateStatus.ACTIVE
+            assert symptom.followup_relevant is True
+
+            clock.set(local_dt(2026, 8, 16, 10, 0).astimezone(timezone.utc))
+            rec.apply(self._symptom_obs(
+                value="improving", obs_type="resolve", key="",
+                observed=clock(), event_id="e2",
+            ))
+            symptom = store.get_state("u", "health", "stomach_pain")
+            assert symptom.status == StateStatus.IMPROVING
+
+            clock.set(local_dt(2026, 8, 16, 12, 0).astimezone(timezone.utc))
+            rec.apply(self._symptom_obs(
+                value="resolved", obs_type="resolve", key="stomach_pain",
+                observed=clock(), event_id="e3",
+            ))
+            symptom = store.get_state("u", "health", "stomach_pain")
+            assert symptom.status == StateStatus.RESOLVED
+            assert symptom.followup_relevant is False
+            chain = [t.from_status for t in store.get_transitions(symptom.state_id)] + \
+                [store.get_transitions(symptom.state_id)[-1].to_status]
+            assert chain == ["active", "active", "improving", "resolved"]
+        finally:
+            service.close()
+
+    def test_symptom_new_episode_after_resolved(self):
+        """A new symptom claim after resolution is a NEW episode — the
+        resolved history stays, a fresh active row is created."""
+        clock = self._clock()
+        service, store = make_service(clock=clock)
+        try:
+            rec = service.reconciler
+            rec.apply(self._symptom_obs(observed=clock(), event_id="e1"))
+            clock.set(local_dt(2026, 8, 16, 12, 0).astimezone(timezone.utc))
+            rec.apply(self._symptom_obs(
+                value="resolved", obs_type="resolve", key="stomach_pain",
+                observed=clock(), event_id="e2",
+            ))
+            clock.set(local_dt(2026, 8, 16, 14, 0).astimezone(timezone.utc))
+            rec.apply(self._symptom_obs(observed=clock(), event_id="e3"))
+            rows = [s for s in store.get_states("u") if s.key == "stomach_pain"]
+            assert len(rows) == 2, "resolved history was overwritten"
+            assert {s.status for s in rows} == {StateStatus.RESOLVED, StateStatus.ACTIVE}
+        finally:
+            service.close()
+
+    def test_v1_symptom_rule_handlers_removed(self):
+        """Migration acceptance: the V1 symptom rule handlers are gone."""
+        from statebar_mcp.core import reconciler as reconciler_mod
+        from statebar_mcp.core.reconciler import Reconciler, _RULE_HANDLERS
+
+        for obs_type in ("symptom", "resolve"):
+            assert obs_type not in _RULE_HANDLERS, (
+                f"V1 handler for {obs_type!r} still registered"
+            )
+        assert not hasattr(reconciler_mod, "_resolve_handler")
+        rec = Reconciler(SQLiteStore(":memory:"))
+        for name in ("_r_symptom_new", "_r7_improving", "_r8_resolved",
+                     "_target_symptom", "_active_symptoms"):
+            assert not hasattr(rec, name), f"V1 symptom handler {name} still present"

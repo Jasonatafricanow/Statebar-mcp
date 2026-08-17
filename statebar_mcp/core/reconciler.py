@@ -1,9 +1,10 @@
 """State Reconciler — the deterministic safety gate (派单总纲 §10, V2 §13).
 
 V1: business rules R1/R2 (explicit sleep/awake language), R4 (activity
-states), R7-R9 and system rules S1-S2 remain during the migration.
+states), R9 and system rules S1-S2 remain during the migration.
 Migrated to the Inference Engine (ontology-driven): R3/R5/R6 + plan
-creation (PLAN_LIFECYCLE), the plan-completion half of R4.
+creation and R4's plan-completion half (PLAN_LIFECYCLE), R7/R8 + symptom
+creation (SYMPTOM_LIFECYCLE).
 V2: executes TransitionIntents produced by the Inference Engine — the
 Reconciler remains the ONLY Canonical State writer and validates every
 mutation (stale guards, idempotency, transition legality, history).
@@ -36,8 +37,6 @@ from .models import (
 from .store import SQLiteStore
 
 logger = logging.getLogger(__name__)
-
-_SYMPTOM_STATUSES = (StateStatus.ACTIVE, StateStatus.IMPROVING)
 
 # statuses whose states may be found as "current" for a key
 _NON_TERMINAL = tuple(
@@ -600,76 +599,6 @@ class Reconciler:
         self._apply(new, self._transition(new, new.status, "R4 activity completed (recent)", obs))
         return [new]
 
-    # -- R7 / R8 : symptoms (still V1 — migrated in the next step) --------------
-
-    def _active_symptoms(self, states: List[State]) -> List[State]:
-        return [s for s in states if s.category == "health" and s.status in _SYMPTOM_STATUSES]
-
-    def _target_symptom(self, obs: Observation, states: List[State]) -> Optional[State]:
-        symptoms = self._active_symptoms(states)
-        if obs.key:
-            for s in symptoms:
-                if s.key == obs.key:
-                    return s
-            return None
-        return max(symptoms, key=lambda s: s.updated_at) if symptoms else None
-
-    def _r_symptom_new(self, obs: Observation, states: List[State]) -> List[State]:
-        if self._is_stale_creation(obs, states, obs.key):
-            return []
-        existing = self._latest_for_key(states, "health", obs.key)
-        if existing is not None:
-            if obs.observed_at < existing.last_observed_at:
-                return []
-            if existing.status in _SYMPTOM_STATUSES:
-                if self._mutate(
-                    existing, obs,
-                    status=StateStatus.ACTIVE,
-                    followup_relevant=True,
-                    reason="symptom re-affirmed active",
-                ):
-                    return [existing]
-                return []
-            if existing.status in (StateStatus.RESOLVED, StateStatus.SUPERSEDED):
-                # new episode
-                valid_until = obs.observed_at + timedelta(hours=lifecycle.TTL_NOW_HOURS)
-                new = self._create(
-                    obs, "health", obs.key, "active", StateStatus.ACTIVE, Certainty.CONFIRMED,
-                    obs.observed_at, valid_until, valid_until, True, 5,
-                )
-                self._apply(new, self._transition(new, new.status, "symptom new episode", obs))
-                return [new]
-        valid_until = obs.observed_at + timedelta(hours=lifecycle.TTL_NOW_HOURS)
-        new = self._create(
-            obs, "health", obs.key, "active", StateStatus.ACTIVE, Certainty.CONFIRMED,
-            obs.observed_at, valid_until, valid_until, True, 5,
-        )
-        self._apply(new, self._transition(new, new.status, "symptom active", obs))
-        return [new]
-
-    def _r7_improving(self, obs: Observation, states: List[State]) -> List[State]:
-        symptom = self._target_symptom(obs, states)
-        if symptom is None:
-            logger.info("R7: improving with no active symptom target; observation-only")
-            return []
-        if self._mutate(symptom, obs, status=StateStatus.IMPROVING, reason="R7 symptom improving"):
-            return [symptom]
-        return []
-
-    def _r8_resolved(self, obs: Observation, states: List[State]) -> List[State]:
-        symptom = self._target_symptom(obs, states)
-        if symptom is None:
-            logger.info("R8: resolved with no active symptom target; observation-only")
-            return []
-        if self._mutate(
-            symptom, obs,
-            status=StateStatus.RESOLVED,
-            followup_relevant=False,
-            reason="R8 symptom resolved",
-        ):
-            return [symptom]
-        return []
-
     # -- R9 : explicit user description supersedes inference -------------------------
 
     def _apply_r9(self, obs: Observation, states: List[State]) -> List[State]:
@@ -690,23 +619,12 @@ class Reconciler:
         return changed
 
 
-def _resolve_handler(rec: Reconciler, obs: Observation, states: List[State]) -> List[State]:
-    if obs.type == ObservationType.RESOLVE or (
-        obs.type == ObservationType.SYMPTOM and obs.value in ("improving", "resolved")
-    ):
-        if obs.value == "resolved":
-            return rec._r8_resolved(obs, states)
-        return rec._r7_improving(obs, states)
-    return rec._r_symptom_new(obs, states)
-
-
-# Plan observations (PLAN/CANCEL) are owned by the Inference Engine
-# (PLAN_LIFECYCLE); their V1 handlers were migrated and deleted.
+# Plan observations (PLAN/CANCEL) and symptom observations (SYMPTOM/RESOLVE)
+# are owned by the Inference Engine (PLAN_LIFECYCLE / SYMPTOM_LIFECYCLE);
+# their V1 handlers were migrated and deleted.
 _RULE_HANDLERS: Dict[str, object] = {
     ObservationType.AWAKE: lambda rec, obs, states: rec._r1_awake(obs, states),
     ObservationType.SLEEP: lambda rec, obs, states: rec._r2_sleep(obs, states),
     ObservationType.ACTIVITY: lambda rec, obs, states: rec._r4_completed(obs, states),
-    ObservationType.SYMPTOM: _resolve_handler,
-    ObservationType.RESOLVE: _resolve_handler,
     # ObservationType.STATE is intentionally unmapped: conservative principle.
 }

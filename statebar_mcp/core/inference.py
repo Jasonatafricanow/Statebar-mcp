@@ -10,11 +10,15 @@ Phase 1 implements the interaction vertical slice (V2 §20):
     → SUPERSEDE sleeping + ESTABLISH/UPDATE awake (confirmation only —
       NEVER claims a precise wake time, V2-T6).
 
-Phase 2 (migration of the V1 business rules, V2 §22) adds the plan slice:
+Phase 2 (migration of the V1 business rules, V2 §22) adds the plan and
+symptom slices:
 
-    plan / cancel / activity(plan completion) observations → PLAN_LIFECYCLE
-    intents: ESTABLISH (tentative/planned), UPDATE (planned/cancelled/
-    completed), SUPERSEDE+ESTABLISH (reschedule to a new window).
+    plan / cancel / activity(plan completion) → PLAN_LIFECYCLE intents
+        ESTABLISH (tentative/planned), UPDATE (planned/cancelled/completed),
+        SUPERSEDE+ESTABLISH (reschedule to a new window);
+    symptom / resolve → SYMPTOM_LIFECYCLE intents
+        ESTABLISH (active), UPDATE (re-affirmed active / improving /
+        resolved).
 
 Every other observation returns NO intents; the Reconciler then falls back
 to the V1 rule handlers (remaining rules stay alive during migration,
@@ -74,8 +78,7 @@ class InferenceEngine:
         if obs.type in (ObservationType.PLAN, ObservationType.CANCEL):
             return self._infer_plan(obs, states), True
         if obs.type in (ObservationType.SYMPTOM, ObservationType.RESOLVE):
-            # owned in the next migration step; V1 handlers still run
-            return [], False
+            return self._infer_symptom(obs, states), True
         if obs.type == ObservationType.ACTIVITY:
             # partial ownership: only the plan-completion half. When no
             # active plan is targeted, V1 R4 keeps creating activity states.
@@ -334,7 +337,99 @@ class InferenceEngine:
 
     # -- phase 2 slice: symptoms (SYMPTOM_LIFECYCLE, V1 R7/R8) ----------------
 
+    def _symptom_target(self, obs: Observation, states: List[State]) -> Optional[State]:
+        symptoms = [
+            s for s in states
+            if s.category == "health"
+            and s.status in (StateStatus.ACTIVE, StateStatus.IMPROVING)
+        ]
+        if obs.key:
+            for s in symptoms:
+                if s.key == obs.key:
+                    return s
+            return None
+        return max(symptoms, key=lambda s: s.updated_at) if symptoms else None
+
     def _infer_symptom(self, obs: Observation, states: List[State]) -> List[TransitionIntent]:
-        """Migrated in the next step; during migration the V1 handlers
-        still own symptom observations."""
-        return []
+        intents: List[TransitionIntent] = []
+        evidence = [f"{obs.event_id}:{obs.observation_index}"]
+
+        if obs.type == ObservationType.RESOLVE or obs.value in ("improving", "resolved"):
+            symptom = self._symptom_target(obs, states)
+            if symptom is None:
+                logger.info(
+                    "resolve with no active symptom target; observation-only"
+                )
+                return intents
+            if obs.value == "resolved":
+                intents.append(
+                    TransitionIntent(
+                        action=IntentAction.UPDATE,
+                        reason="R8 symptom resolved (SYMPTOM_LIFECYCLE)",
+                        evidence=evidence,
+                        target_state_id=symptom.state_id,
+                        target_category=symptom.category,
+                        target_key=symptom.key,
+                        status=StateStatus.RESOLVED,
+                        followup_relevant=False,
+                    )
+                )
+            else:
+                intents.append(
+                    TransitionIntent(
+                        action=IntentAction.UPDATE,
+                        reason="R7 symptom improving (SYMPTOM_LIFECYCLE)",
+                        evidence=evidence,
+                        target_state_id=symptom.state_id,
+                        target_category=symptom.category,
+                        target_key=symptom.key,
+                        status=StateStatus.IMPROVING,
+                    )
+                )
+            return intents
+
+        # symptom create / re-affirm active
+        existing = self._latest_health_for_key(states, obs.key)
+        if existing is not None:
+            if obs.observed_at < existing.last_observed_at:
+                return intents  # stale: newer evidence owns this key
+            if existing.status in (StateStatus.ACTIVE, StateStatus.IMPROVING):
+                intents.append(
+                    TransitionIntent(
+                        action=IntentAction.UPDATE,
+                        reason="symptom re-affirmed active",
+                        evidence=evidence,
+                        target_state_id=existing.state_id,
+                        target_category=existing.category,
+                        target_key=existing.key,
+                        status=StateStatus.ACTIVE,
+                        followup_relevant=True,
+                    )
+                )
+                return intents
+        until = obs.observed_at + timedelta(hours=lifecycle.TTL_NOW_HOURS)
+        intents.append(
+            TransitionIntent(
+                action=IntentAction.ESTABLISH,
+                reason="symptom active (SYMPTOM_LIFECYCLE)",
+                evidence=evidence,
+                category="health",
+                key=obs.key,
+                value="active",
+                status=StateStatus.ACTIVE,
+                certainty=Certainty.CONFIRMED,
+                valid_from=obs.observed_at,
+                valid_until=until,
+                relevant_until=until,
+                followup_relevant=True,
+                snapshot_priority=5,
+            )
+        )
+        return intents
+
+    @staticmethod
+    def _latest_health_for_key(states: List[State], key: str) -> Optional[State]:
+        matches = [s for s in states if s.category == "health" and s.key == key]
+        if not matches:
+            return None
+        return max(matches, key=lambda s: s.updated_at)
