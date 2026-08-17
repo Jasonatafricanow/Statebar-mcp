@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from typing import List, Tuple
 
-from .models import Certainty, Observation, State, StateStatus
+from .models import Certainty, Observation, SourceType, State, StateStatus
 
 # (category, key) pairs that cannot both be current.
 # Phase 1: awake vs sleeping.
@@ -47,9 +47,16 @@ def incompatible_pairs_of(category: str, key: str) -> List[Tuple[str, str]]:
 def is_interaction_observation(obs: Observation) -> bool:
     """The user's real-time behavior itself: a user-authored interaction
     happened (message/voice/action). Determined by the SYSTEM, never by
-    language analysis."""
+    language analysis.
+
+    The trusted source is required: only observations the system itself
+    issued with ``source.type == interaction`` qualify as behavioral
+    evidence. A language-extracted observation with the same shape but a
+    different source (e.g. assistant_question, conversation) is NOT the
+    user's behavior and must never establish user state."""
     return (
-        obs.type == "activity"
+        obs.source.type == SourceType.INTERACTION
+        and obs.type == "activity"
         and obs.category == "presence"
         and obs.key == "interactive_activity"
         and obs.certainty == Certainty.OBSERVED

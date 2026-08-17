@@ -21,6 +21,7 @@ sys.path.insert(0, str(ROOT))
 from statebar_mcp.core.extractor.persistent import MockExtractor  # noqa: E402
 from statebar_mcp.core.models import (  # noqa: E402
     Certainty,
+    Observation,
     ObserveRequest,
     Source,
     SourceType,
@@ -260,5 +261,93 @@ class TestV2EvidencePrecedence:
             assert sleeping.status == "active", (
                 "interaction evidence contradicted an explicit sleep claim"
             )
+        finally:
+            service.close()
+
+
+class TestV2TrustBoundary:
+    """P1: system-issued behavioral evidence must stay the ONLY source of
+    behavioral inference. A language-extracted observation that merely LOOKS
+    like the interaction shape must never create user state."""
+
+    def test_assistant_sourced_interaction_lookalike_creates_no_awake(self):
+        """The reviewer's repro: source=assistant_question with
+        key=interactive_activity / certainty=observed used to establish
+        'awake active' because inference ran before the assistant-only S1
+        gate. It must be ignored at both layers (predicate + S1)."""
+        service, store = make_service()
+        try:
+            t = datetime.now(timezone.utc)
+            lookalike = Observation(
+                subject_id="u",
+                event_id="e1",
+                type="activity",
+                category="presence",
+                key="interactive_activity",
+                value="true",
+                certainty=Certainty.OBSERVED,
+                source=Source(type=SourceType.ASSISTANT_QUESTION),
+                observed_at=t,
+                confidence=1.0,
+                raw_payload="你还醒着吗？",
+            )
+            changed = service.reconcile(lookalike)
+            assert changed == []
+            assert store.get_state("u", "sleep", "awake") is None, (
+                "assistant-sourced look-alike established awake state"
+            )
+            assert store.counts()["states"] == 0
+            # recorded as applied (no endless reprocessing), never as state
+            assert store.is_observation_applied("u", "e1", 0)
+        finally:
+            service.close()
+
+    def test_plain_conversation_lookalike_creates_no_awake(self):
+        """Same shape but source=conversation (language-extracted, not
+        system-issued) must also fail the interaction predicate."""
+        service, store = make_service()
+        try:
+            t = datetime.now(timezone.utc)
+            lookalike = Observation(
+                subject_id="u",
+                event_id="e1",
+                type="activity",
+                category="presence",
+                key="interactive_activity",
+                value="true",
+                certainty=Certainty.OBSERVED,
+                source=Source(type=SourceType.CONVERSATION),
+                observed_at=t,
+                confidence=1.0,
+                raw_payload="背有点僵",
+            )
+            changed = service.reconcile(lookalike)
+            # not owned by inference (wrong source) → falls back to V1 rules;
+            # the sleep/awake boundary must stay untouched either way
+            assert store.get_state("u", "sleep", "awake") is None
+        finally:
+            service.close()
+
+    def test_S1_gate_covers_every_entry_before_inference(self):
+        """An assistant-sourced AWAKE observation must stay observation-only
+        even though V2 inference now runs ahead of the V1 rule handlers."""
+        service, store = make_service()
+        try:
+            t = datetime.now(timezone.utc)
+            assistant_awake = Observation(
+                subject_id="u",
+                event_id="e1",
+                type="awake",
+                category="sleep",
+                key="awake",
+                value="awake",
+                source=Source(type=SourceType.ASSISTANT_QUESTION),
+                observed_at=t,
+                raw_payload="你今天是不是刚睡醒？",
+            )
+            changed = service.reconcile(assistant_awake)
+            assert changed == []
+            assert store.counts()["states"] == 0
+            assert store.is_observation_applied("u", "e1", 0)
         finally:
             service.close()

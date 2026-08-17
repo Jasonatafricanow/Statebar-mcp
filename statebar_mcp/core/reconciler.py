@@ -259,6 +259,17 @@ class Reconciler:
                 obs.event_id, obs.observation_index,
             )
             return []
+        # S1 (system rule) — enforced BEFORE the inference gate: assistant-
+        # sourced observations can never create or change canonical state,
+        # no matter which engine (V1 rules or V2 inference) would claim them.
+        # This keeps "assistant content never creates user state" a full-
+        # entry boundary even for engine-issued look-alike observations.
+        if obs.source.type == SourceType.ASSISTANT_QUESTION:
+            logger.info("S1: assistant-sourced observation %s ignored", obs.type)
+            self.store.mark_observation_applied(
+                obs.subject_id, obs.event_id, obs.observation_index
+            )
+            return []
         states = self._active_states(obs.subject_id)
         intents, handled = self.inference.infer(obs, states)
         if handled:
@@ -389,7 +400,9 @@ class Reconciler:
     def _apply_inner(self, obs: Observation, states: List[State]) -> List[State]:
         changed: List[State] = []
 
-        # S1: assistant-only observations can never create canonical state.
+        # S1 is enforced in apply() before the inference gate (so it also
+        # covers inference-owned observations); kept here for direct callers
+        # of _apply_inner.
         if obs.source.type == SourceType.ASSISTANT_QUESTION:
             logger.info("S1: assistant-sourced observation %s ignored", obs.type)
             return changed
