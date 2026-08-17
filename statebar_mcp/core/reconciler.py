@@ -16,7 +16,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
-from . import lifecycle
+from . import lifecycle, ontology
 from .inference import InferenceEngine
 from .models import (
     Certainty,
@@ -294,6 +294,12 @@ class Reconciler:
                 target = self._intent_target(states, intent)
                 if target is None:
                     continue  # already gone (e.g. replayed) — nothing to do
+                # Transition legality gate (ontology.validate_transition):
+                # every status change goes through the declared lifecycle
+                # BEFORE any write (V2 §13). Illegal hops are rejected as a
+                # whole — the intent is dropped, the state is untouched.
+                if not self._legal_transition(target, StateStatus.SUPERSEDED, intent):
+                    continue
                 if self._supersede(target, obs, intent.reason):
                     changed.append(target)
             elif intent.action == IntentAction.ESTABLISH:
@@ -323,6 +329,11 @@ class Reconciler:
                     or (intent.status and intent.status != target.status)
                     or (intent.certainty and intent.certainty != target.certainty)
                 )
+                if intent.status and intent.status != target.status:
+                    # status-changing UPDATE also goes through the legality
+                    # gate before the write
+                    if not self._legal_transition(target, intent.status, intent):
+                        continue
                 if semantic_change:
                     if self._mutate(
                         target, obs,
@@ -347,11 +358,27 @@ class Reconciler:
                     if intent.action == IntentAction.RESOLVE
                     else StateStatus.EXPIRED
                 )
+                if not self._legal_transition(target, to_status, intent):
+                    continue
                 if self._mutate(target, obs, status=to_status, reason=intent.reason):
                     changed.append(target)
             else:  # pragma: no cover — future actions
                 logger.warning("unknown intent action %r ignored", intent.action)
         return changed
+
+    def _legal_transition(
+        self, state: State, to_status: str, intent: TransitionIntent
+    ) -> bool:
+        """V2 §13 transition legality gate (ontology-driven). Conservative:
+        transitions not covered by any declared lifecycle of the state's
+        category are rejected before the write."""
+        if ontology.validate_transition(state, to_status):
+            return True
+        logger.warning(
+            "intent %s rejected by transition legality gate: %s/%s %s -> %s",
+            intent.action, state.category, state.key, state.status, to_status,
+        )
+        return False
 
     def _intent_target(
         self, states: List[State], intent: TransitionIntent

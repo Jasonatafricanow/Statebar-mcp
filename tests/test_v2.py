@@ -18,14 +18,18 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from statebar_mcp.core import ontology  # noqa: E402
 from statebar_mcp.core.extractor.persistent import MockExtractor  # noqa: E402
 from statebar_mcp.core.models import (  # noqa: E402
     Certainty,
+    IntentAction,
     Observation,
     ObserveRequest,
     Source,
     SourceType,
+    State,
     StateStatus,
+    TransitionIntent,
 )
 from statebar_mcp.core.service import UserStateService  # noqa: E402
 from statebar_mcp.core.store import SQLiteStore  # noqa: E402
@@ -351,3 +355,76 @@ class TestV2TrustBoundary:
             assert store.is_observation_applied("u", "e1", 0)
         finally:
             service.close()
+
+
+class TestV2TransitionLegalityGate:
+    """P2: ontology.validate_transition is wired into the intent execution
+    path — an intent whose status hop is not in the declared lifecycle is
+    rejected BEFORE any write."""
+
+    def test_sleep_resolve_intent_rejected_by_gate(self):
+        """The reviewer's injection: a RESOLVE intent against a sleep state.
+        ontology.validate_transition returns False for sleep ACTIVE→RESOLVED
+        (SLEEP_LIFECYCLE only allows ACTIVE/SUPERSEDED); the executor must
+        refuse to change the status."""
+        service, store = make_service()
+        try:
+            t = datetime.now(timezone.utc)
+            observe(service, "u", "e1", "我睡了", t)
+            sleeping = store.get_state("u", "sleep", "sleeping")
+            assert sleeping.status == "active"
+            assert ontology.validate_transition(
+                sleeping, StateStatus.RESOLVED
+            ) is False, "sleep→resolved must be illegal in the ontology"
+
+            inject = Observation(
+                subject_id="u", event_id="e2", type="resolve",
+                category="health", key="", value="resolved",
+                source=Source(type=SourceType.SYSTEM),
+                observed_at=t, raw_payload="fault injection",
+            )
+            intent = TransitionIntent(
+                action=IntentAction.RESOLVE,
+                reason="injected illegal sleep RESOLVE",
+                evidence=[],
+                target_state_id=sleeping.state_id,
+                target_category="sleep",
+                target_key="sleeping",
+            )
+            rec = service.reconciler
+            changed = rec._execute_intents(inject, rec._active_states("u"), [intent])
+            assert changed == [], "illegal intent was executed"
+
+            sleeping = store.get_state("u", "sleep", "sleeping")
+            assert sleeping.status == "active", (
+                "transition legality gate rejected the hop but the executor "
+                "still changed the status"
+            )
+            assert len(store.get_transitions(sleeping.state_id)) == 1, (
+                "rejected intent still wrote a transition row"
+            )
+        finally:
+            service.close()
+
+    def test_declared_lifecycles_pass_the_gate(self):
+        """The gate must not block hops that the declared lifecycles allow
+        (used by the migration steps): plan tentative→planned→cancelled and
+        symptom active→improving→resolved."""
+        plan = State(
+            subject_id="u", category="planning", key="calligraphy",
+            status=StateStatus.TENTATIVE,
+        )
+        assert ontology.validate_transition(plan, StateStatus.PLANNED)
+        assert ontology.validate_transition(plan, StateStatus.CANCELLED)
+        symptom = State(
+            subject_id="u", category="health", key="stomach_pain",
+            status=StateStatus.ACTIVE,
+        )
+        assert ontology.validate_transition(symptom, StateStatus.IMPROVING)
+        assert ontology.validate_transition(symptom, StateStatus.RESOLVED)
+        # sleep→superseded (the interaction slice) stays legal
+        sleeping = State(
+            subject_id="u", category="sleep", key="sleeping",
+            status=StateStatus.ACTIVE,
+        )
+        assert ontology.validate_transition(sleeping, StateStatus.SUPERSEDED)
