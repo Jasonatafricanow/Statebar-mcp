@@ -72,6 +72,7 @@ SLEEP_LIFECYCLE = (StateStatus.ACTIVE, StateStatus.SUPERSEDED)  # preparing→sl
 PLAN_LIFECYCLE = (
     StateStatus.TENTATIVE, StateStatus.PLANNED, StateStatus.ACTIVE,
     StateStatus.COMPLETED, StateStatus.CANCELLED, StateStatus.EXPIRED,
+    StateStatus.SUPERSEDED,  # reschedule: the old window episode is superseded
 )
 SYMPTOM_LIFECYCLE = (StateStatus.ACTIVE, StateStatus.IMPROVING, StateStatus.RESOLVED)
 

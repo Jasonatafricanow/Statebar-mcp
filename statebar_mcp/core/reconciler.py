@@ -1,6 +1,9 @@
 """State Reconciler — the deterministic safety gate (派单总纲 §10, V2 §13).
 
-V1: business rules R1-R10 + system rules S1-S2 (kept during migration).
+V1: business rules R1/R2 (explicit sleep/awake language), R4 (activity
+states), R7-R9 and system rules S1-S2 remain during the migration.
+Migrated to the Inference Engine (ontology-driven): R3/R5/R6 + plan
+creation (PLAN_LIFECYCLE), the plan-completion half of R4.
 V2: executes TransitionIntents produced by the Inference Engine — the
 Reconciler remains the ONLY Canonical State writer and validates every
 mutation (stale guards, idempotency, transition legality, history).
@@ -34,7 +37,6 @@ from .store import SQLiteStore
 
 logger = logging.getLogger(__name__)
 
-_PLAN_STATUSES = (StateStatus.TENTATIVE, StateStatus.PLANNED, StateStatus.PENDING)
 _SYMPTOM_STATUSES = (StateStatus.ACTIVE, StateStatus.IMPROVING)
 
 # statuses whose states may be found as "current" for a key
@@ -49,7 +51,7 @@ class Reconciler:
     def __init__(self, store: SQLiteStore, now_fn=utc_now, inference=None):
         self.store = store
         self._now_fn = now_fn
-        self.inference = inference or InferenceEngine()
+        self.inference = inference or InferenceEngine(now_fn=now_fn)
 
     def _now(self) -> datetime:
         return self._now_fn()
@@ -343,13 +345,18 @@ class Reconciler:
                     continue
                 if self._replay_blocked_by_latest(obs, intent.key):
                     continue
-                valid_until = obs.observed_at + timedelta(
-                    hours=lifecycle.TTL_AWAKE_HOURS
+                # The inference engine owns the semantic windows (plans:
+                # semantic_window; symptoms: TTL; interaction awake: TTL).
+                # The awake-TTL default only backs phase-1 intents that
+                # deliberately left the windows unset.
+                valid_until = intent.valid_until or (
+                    obs.observed_at + timedelta(hours=lifecycle.TTL_AWAKE_HOURS)
                 )
                 new = self._create(
                     obs, intent.category, intent.key, intent.value, intent.status,
-                    intent.certainty, obs.observed_at, valid_until, valid_until,
-                    intent.followup_relevant, intent.snapshot_priority,
+                    intent.certainty, intent.valid_from or obs.observed_at,
+                    valid_until, intent.relevant_until or valid_until,
+                    bool(intent.followup_relevant), intent.snapshot_priority,
                 )
                 self._apply(
                     new,
@@ -366,6 +373,18 @@ class Reconciler:
                     (intent.value not in (None, "", target.value))
                     or (intent.status and intent.status != target.status)
                     or (intent.certainty and intent.certainty != target.certainty)
+                    or (
+                        intent.valid_until is not None
+                        and intent.valid_until != target.valid_until
+                    )
+                    or (
+                        intent.relevant_until is not None
+                        and intent.relevant_until != target.relevant_until
+                    )
+                    or (
+                        intent.followup_relevant is not None
+                        and intent.followup_relevant != target.followup_relevant
+                    )
                 )
                 if intent.status and intent.status != target.status:
                     # status-changing UPDATE also goes through the legality
@@ -378,6 +397,10 @@ class Reconciler:
                         status=intent.status or None,
                         value=intent.value or None,
                         certainty=intent.certainty or None,
+                        valid_from=intent.valid_from,
+                        valid_until=intent.valid_until,
+                        relevant_until=intent.relevant_until,
+                        followup_relevant=intent.followup_relevant,
                         reason=intent.reason,
                         evidence=intent.evidence,
                     ):
@@ -554,106 +577,30 @@ class Reconciler:
         changed.append(new)
         return changed
 
-    # -- R3 / R5 / R6 : plans ---------------------------------------------------
+    # -- R4 : activity completed (activity states only; the plan-completion
+    #    half of R4 is owned by the inference engine → PLAN_LIFECYCLE) --------
 
-    def _plans(self, states: List[State]) -> List[State]:
-        return [s for s in states if s.category == "planning" and s.status in _PLAN_STATUSES]
-
-    def _target_plan(self, obs: Observation, states: List[State]) -> Optional[State]:
-        plans = self._plans(states)
-        if obs.key:
-            for s in plans:
-                if s.key == obs.key:
-                    return s
-            return None
-        return max(plans, key=lambda s: s.updated_at) if plans else None
-
-    def _r3_cancel(self, obs: Observation, states: List[State]) -> List[State]:
-        plan = self._target_plan(obs, states)
-        if plan is None:
-            logger.info("R3: cancel with no active plan target; observation-only")
-            return []
-        if self._mutate(
-            plan, obs,
-            status=StateStatus.CANCELLED,
-            relevant_until=self._now() + timedelta(hours=6),
-            followup_relevant=False,
-            reason="R3 plan cancelled",
-        ):
-            return [plan]
-        return []
-
-    def _r5_confirm(self, obs: Observation, states: List[State]) -> List[State]:
-        if obs.certainty not in (Certainty.PLANNED, Certainty.CONFIRMED):
-            return []
-        plan = self._target_plan(obs, states)
-        if plan is None or plan.status != StateStatus.TENTATIVE:
-            return []
-        if self._mutate(
-            plan, obs,
-            status=StateStatus.PLANNED,
-            certainty=obs.certainty,
-            reason="R5 tentative plan confirmed to planned",
-        ):
-            return [plan]
-        return []
-
-    def _r6_reschedule(self, obs: Observation, states: List[State]) -> List[State]:
-        plan = self._target_plan(obs, states)
-        if plan is None:
-            return []
-        _, new_until, new_relevant = lifecycle.semantic_window(
-            obs.time_expression, obs.observed_at, self._now()
-        )
-        if new_until != plan.valid_until:
-            if not self._supersede(plan, obs, "R6 reschedule: old window superseded"):
-                return []
-            changed: List[State] = [plan]
-            new = self._create_plan_state(obs, new_until, new_relevant)
-            self._apply(new, self._transition(new, new.status, "R6 reschedule: new window", obs))
-            changed.append(new)
-            return changed
-        return self._r5_confirm(obs, states)
-
-    def _create_plan_state(self, obs: Observation, valid_until, relevant_until) -> State:
-        status = StateStatus.TENTATIVE if obs.certainty == Certainty.TENTATIVE else StateStatus.PLANNED
-        return self._create(
-            obs, "planning", obs.key, obs.value or obs.key, status, obs.certainty,
-            obs.observed_at, valid_until, relevant_until, False, 3,
-        )
-
-    def _r_plan_new(self, obs: Observation, states: List[State]) -> List[State]:
-        """Create a new plan (R5/R6 only mutate existing ones)."""
-        if self._is_stale_creation(obs, states, obs.key):
-            return []
-        existing = self._latest_for_key(states, "planning", obs.key)
-        if existing is not None:
-            # A plan for this key already exists (any status). Do not fork a
-            # second one unless the new observation is newer (conservative
-            # principle: prefer coexisting over speculative merging).
+    def _r4_completed(self, obs: Observation, states: List[State]) -> List[State]:
+        existing = self._latest_for_key_any_category(states, obs.key)
+        if existing is not None and existing.status not in StateStatus.TERMINAL:
             if obs.observed_at < existing.last_observed_at:
                 return []
-            if existing.status in _PLAN_STATUSES:
-                # R6 handles reschedules; R5 handles confirmations. If the
-                # window is identical, just re-affirm.
-                return self._r6_reschedule(obs, states)
-            if existing.status in (StateStatus.COMPLETED, StateStatus.CANCELLED,
-                                   StateStatus.EXPIRED, StateStatus.RESOLVED):
-                # a new, distinct plan episode for the same key
-                _, valid_until, relevant_until = lifecycle.semantic_window(
-                    obs.time_expression, obs.observed_at, self._now()
-                )
-                new = self._create_plan_state(obs, valid_until, relevant_until)
-                self._apply(new, self._transition(new, new.status, "plan created (new episode)", obs))
-                return [new]
-        _, valid_until, relevant_until = lifecycle.semantic_window(
-            obs.time_expression, obs.observed_at, self._now()
+            if self._mutate(existing, obs, status=StateStatus.COMPLETED, reason="R4 activity re-completed"):
+                return [existing]
+            return []
+        if self._is_stale_creation(obs, states, obs.key):
+            return []
+        relevant_until = lifecycle.relevant_until_for_activity(obs.observed_at)
+        valid_until = obs.observed_at + timedelta(hours=lifecycle.TTL_DEFAULT_HOURS)
+        category = obs.category or "activity"
+        new = self._create(
+            obs, category, obs.key, obs.value or "completed", StateStatus.COMPLETED,
+            Certainty.CONFIRMED, obs.observed_at, valid_until, relevant_until, False, 2,
         )
-        new = self._create_plan_state(obs, valid_until, relevant_until)
-        self._apply(new, self._transition(new, new.status, "plan created", obs))
+        self._apply(new, self._transition(new, new.status, "R4 activity completed (recent)", obs))
         return [new]
 
-    # -- R7 / R8 : symptoms ------------------------------------------------------
+    # -- R7 / R8 : symptoms (still V1 — migrated in the next step) --------------
 
     def _active_symptoms(self, states: List[State]) -> List[State]:
         return [s for s in states if s.category == "health" and s.status in _SYMPTOM_STATUSES]
@@ -723,33 +670,6 @@ class Reconciler:
             return [symptom]
         return []
 
-    # -- R4 : activity completed ---------------------------------------------------
-
-    def _r4_completed(self, obs: Observation, states: List[State]) -> List[State]:
-        plan = self._target_plan(obs, states)
-        if plan is not None:
-            if self._mutate(plan, obs, status=StateStatus.COMPLETED, reason="R4 plan completed"):
-                return [plan]
-            return []
-        existing = self._latest_for_key_any_category(states, obs.key)
-        if existing is not None and existing.status not in StateStatus.TERMINAL:
-            if obs.observed_at < existing.last_observed_at:
-                return []
-            if self._mutate(existing, obs, status=StateStatus.COMPLETED, reason="R4 activity re-completed"):
-                return [existing]
-            return []
-        if self._is_stale_creation(obs, states, obs.key):
-            return []
-        relevant_until = lifecycle.relevant_until_for_activity(obs.observed_at)
-        valid_until = obs.observed_at + timedelta(hours=lifecycle.TTL_DEFAULT_HOURS)
-        category = obs.category or "activity"
-        new = self._create(
-            obs, category, obs.key, obs.value or "completed", StateStatus.COMPLETED,
-            Certainty.CONFIRMED, obs.observed_at, valid_until, relevant_until, False, 2,
-        )
-        self._apply(new, self._transition(new, new.status, "R4 activity completed (recent)", obs))
-        return [new]
-
     # -- R9 : explicit user description supersedes inference -------------------------
 
     def _apply_r9(self, obs: Observation, states: List[State]) -> List[State]:
@@ -780,11 +700,11 @@ def _resolve_handler(rec: Reconciler, obs: Observation, states: List[State]) -> 
     return rec._r_symptom_new(obs, states)
 
 
+# Plan observations (PLAN/CANCEL) are owned by the Inference Engine
+# (PLAN_LIFECYCLE); their V1 handlers were migrated and deleted.
 _RULE_HANDLERS: Dict[str, object] = {
     ObservationType.AWAKE: lambda rec, obs, states: rec._r1_awake(obs, states),
     ObservationType.SLEEP: lambda rec, obs, states: rec._r2_sleep(obs, states),
-    ObservationType.CANCEL: lambda rec, obs, states: rec._r3_cancel(obs, states),
-    ObservationType.PLAN: lambda rec, obs, states: rec._r_plan_new(obs, states),
     ObservationType.ACTIVITY: lambda rec, obs, states: rec._r4_completed(obs, states),
     ObservationType.SYMPTOM: _resolve_handler,
     ObservationType.RESOLVE: _resolve_handler,

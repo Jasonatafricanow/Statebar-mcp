@@ -25,6 +25,9 @@ TTL_NOW_HOURS = 12.0
 TTL_AWAKE_HOURS = 16.0
 TTL_SLEEP_HOURS = 12.0
 
+# A cancelled plan stays briefly conversational (recently-cancelled bucket).
+CANCEL_RELEVANT_HOURS = 6.0
+
 
 def _local_tz(now: datetime) -> timezone:
     return now.astimezone().tzinfo or timezone.utc

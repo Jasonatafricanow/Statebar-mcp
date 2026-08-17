@@ -372,13 +372,18 @@ class TransitionIntent:
     target_state_id: str = ""
     target_category: str = ""
     target_key: str = ""
-    # ESTABLISH payload:
+    # ESTABLISH payload (also the semantic windows carried by every action
+    # that touches them; None = "no change" for UPDATE, "compute default"
+    # for ESTABLISH):
     category: str = ""
     key: str = ""
     value: str = ""
     status: str = StateStatus.ACTIVE
     certainty: str = Certainty.OBSERVED
-    followup_relevant: bool = False
+    valid_from: Optional[datetime] = None
+    valid_until: Optional[datetime] = None
+    relevant_until: Optional[datetime] = None
+    followup_relevant: Optional[bool] = None
     snapshot_priority: int = 0
 
     def to_dict(self) -> Dict[str, Any]:

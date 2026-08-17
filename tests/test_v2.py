@@ -499,3 +499,133 @@ class TestV2V1Coexistence:
             assert awake is None, "same-second interaction established awake"
         finally:
             service.close()
+
+
+class TestV2MigrationPlans:
+    """R3-R5 migration (PLAN_LIFECYCLE): plan observations are now owned by
+    the Inference Engine; the V1 plan rule handlers are gone."""
+
+    def _clock(self):
+        return FixedClock(local_dt(2026, 8, 16, 8, 0).astimezone(timezone.utc))
+
+    def _plan_obs(self, key, certainty=Certainty.TENTATIVE,
+                  time_expr="afternoon", observed=None, event_id="e1"):
+        from statebar_mcp.core.models import Observation
+
+        return Observation(
+            subject_id="u", event_id=event_id, type="plan",
+            category="planning", key=key, value="", certainty=certainty,
+            time_expression=time_expr, source=Source(type="conversation"),
+            observed_at=observed or datetime.now(timezone.utc),
+            raw_payload="下午可能去写书法",
+        )
+
+    def test_inference_owns_plan_observations(self):
+        from statebar_mcp.core.inference import InferenceEngine
+
+        clock = self._clock()
+        engine = InferenceEngine(now_fn=clock)
+        obs = self._plan_obs("calligraphy", observed=clock())
+        intents, handled = engine.infer(obs, [])
+        assert handled is True, "plan observation must be owned by inference"
+        assert len(intents) == 1
+        assert intents[0].action == "ESTABLISH"
+        assert intents[0].category == "planning"
+        assert intents[0].key == "calligraphy"
+        assert intents[0].status == StateStatus.TENTATIVE
+
+    def test_plan_lifecycle_chain_end_to_end(self):
+        """tentative → planned → cancelled, all through inference intents
+        with PLAN_LIFECYCLE-legal hops and persisted transitions."""
+        clock = self._clock()
+        service, store = make_service(clock=clock)
+        try:
+            rec = service.reconciler
+            rec.apply(self._plan_obs("calligraphy", observed=clock(), event_id="e1"))
+            plan = store.get_state("u", "planning", "calligraphy")
+            assert plan.status == StateStatus.TENTATIVE
+
+            clock.set(local_dt(2026, 8, 16, 9, 0).astimezone(timezone.utc))
+            rec.apply(self._plan_obs(
+                "calligraphy", certainty=Certainty.PLANNED,
+                observed=clock(), event_id="e2",
+            ))
+            plan = store.get_state("u", "planning", "calligraphy")
+            assert plan.status == StateStatus.PLANNED
+            assert plan.certainty == Certainty.PLANNED
+
+            clock.set(local_dt(2026, 8, 16, 10, 0).astimezone(timezone.utc))
+            cancel = Observation(
+                subject_id="u", event_id="e3", type="cancel",
+                category="planning", key="", value="cancel",
+                source=Source(type="conversation"), observed_at=clock(),
+                raw_payload="算了，不去了",
+            )
+            rec.apply(cancel)
+            plan = store.get_state("u", "planning", "calligraphy")
+            assert plan.status == StateStatus.CANCELLED
+            chain = [t.from_status for t in store.get_transitions(plan.state_id)] + \
+                [store.get_transitions(plan.state_id)[-1].to_status]
+            assert chain == ["tentative", "tentative", "planned", "cancelled"]
+            # cancel keeps it briefly conversational (relevant window)
+            assert plan.relevant_until > clock()
+        finally:
+            service.close()
+
+    def test_plan_reschedule_new_episode_via_inference(self):
+        """R6: a different semantic window supersedes the old plan episode
+        and establishes a new one — both rows persist, old is superseded."""
+        clock = self._clock()
+        service, store = make_service(clock=clock)
+        try:
+            rec = service.reconciler
+            rec.apply(self._plan_obs("calligraphy", observed=clock(), event_id="e1"))
+            clock.set(local_dt(2026, 8, 16, 16, 50).astimezone(timezone.utc))
+            rec.apply(self._plan_obs(
+                "calligraphy", certainty=Certainty.PLANNED,
+                time_expr="tonight", observed=clock(), event_id="e2",
+            ))
+            plans = [s for s in store.get_states("u") if s.key == "calligraphy"]
+            statuses = {s.status for s in plans}
+            assert StateStatus.SUPERSEDED in statuses
+            current = [s for s in plans if s.status == StateStatus.PLANNED]
+            assert len(current) == 1
+            assert current[0].valid_until.astimezone(LOCAL_TZ).hour == 23
+        finally:
+            service.close()
+
+    def test_plan_completion_by_activity_via_inference(self):
+        """R4's plan half: an activity observation completes the active plan
+        (PLAN_LIFECYCLE → completed)."""
+        clock = self._clock()
+        service, store = make_service(clock=clock)
+        try:
+            rec = service.reconciler
+            rec.apply(self._plan_obs("swimming", observed=clock(), event_id="e1"))
+            clock.set(local_dt(2026, 8, 16, 18, 0).astimezone(timezone.utc))
+            activity = Observation(
+                subject_id="u", event_id="e2", type="activity",
+                category="activity", key="swimming", value="completed",
+                source=Source(type="conversation"), observed_at=clock(),
+                raw_payload="今天去游泳了",
+            )
+            rec.apply(activity)
+            plan = store.get_state("u", "planning", "swimming")
+            assert plan.status == StateStatus.COMPLETED
+        finally:
+            service.close()
+
+    def test_v1_plan_rule_handlers_removed(self):
+        """Migration acceptance: the V1 plan rule handlers are gone from the
+        reconciler; only the still-unmigrated rules remain."""
+        from statebar_mcp.core.reconciler import Reconciler, _RULE_HANDLERS
+
+        for obs_type in ("plan", "cancel"):
+            assert obs_type not in _RULE_HANDLERS, (
+                f"V1 handler for {obs_type!r} still registered"
+            )
+        rec = Reconciler(SQLiteStore(":memory:"))
+        for name in ("_r3_cancel", "_r5_confirm", "_r6_reschedule",
+                     "_r_plan_new", "_create_plan_state", "_plans",
+                     "_target_plan"):
+            assert not hasattr(rec, name), f"V1 plan handler {name} still present"
