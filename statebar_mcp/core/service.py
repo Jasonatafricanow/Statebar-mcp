@@ -242,6 +242,18 @@ class UserStateService:
                 # mark them reconciled — all in the SAME transaction as the
                 # state/transition writes and the final event status.
                 unreconciled = self.store.get_unreconciled_observations(subject_id, event_id)
+                # The async worker re-extracts an already-sync-processed
+                # event at its ORIGINAL semantic time. Its fresh rows are
+                # late analyses, not crash leftovers: re-tag them with the
+                # strict same-or-later ownership rules (the transient
+                # is_replay flag does not survive the store reload) so a
+                # re-analysis can NEVER downgrade or revive a state that a
+                # DIFFERENT observation at the same-or-later semantic time
+                # owns — D8 acceptance flake regression (the re-extracted
+                # symptom used to re-affirm ACTIVE over e8's IMPROVING).
+                for o in unreconciled:
+                    if (o.event_id, o.observation_index) not in replay_keys:
+                        o.is_replay = True
                 self._reconcile_all(subject_id, unreconciled, replay_keys)
                 self.store.mark_observations_reconciled(subject_id, event_id, unreconciled)
                 self.store.set_event_status(subject_id, event_id, "complete")

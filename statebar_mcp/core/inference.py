@@ -73,20 +73,59 @@ class InferenceEngine:
             # S1 (also enforced in Reconciler.apply before this gate):
             # assistant content never creates or changes user state.
             return [], False
+        # R9 (evidence precedence, unified — V2 §22): explicit CONFIRMED
+        # language upgrades inferred/estimated states of the same key. Runs
+        # for EVERY observation type, owned by inference or not; the V1
+        # generic handler was retired.
+        r9 = self._infer_r9(obs, states)
         if ontology.is_interaction_observation(obs):
-            return self._infer_interaction(obs, states), True
+            return self._infer_interaction(obs, states) + r9, True
         if obs.type in (ObservationType.PLAN, ObservationType.CANCEL):
-            return self._infer_plan(obs, states), True
+            return self._infer_plan(obs, states) + r9, True
         if obs.type in (ObservationType.SYMPTOM, ObservationType.RESOLVE):
-            return self._infer_symptom(obs, states), True
+            return self._infer_symptom(obs, states) + r9, True
         if obs.type == ObservationType.ACTIVITY:
             # partial ownership: only the plan-completion half. When no
-            # active plan is targeted, V1 R4 keeps creating activity states.
+            # active plan is targeted, V1 R4 keeps creating activity states
+            # (handled=False) while the R9 intents still apply.
             intents = self._infer_plan_completion(obs, states)
             if intents:
-                return intents, True
-            return [], False
-        return [], False
+                return intents + r9, True
+            return r9, False
+        return r9, False
+
+    def _infer_r9(
+        self, obs: Observation, states: List[State]
+    ) -> List[TransitionIntent]:
+        """R9 evidence precedence (unified rule): explicit CONFIRMED user
+        language supersedes any inferred/estimated state of the same key.
+
+        Mirrors the retired V1 ``_apply_r9`` handler exactly (non-terminal
+        targets, INFERRED/ESTIMATED certainty, same key, not stale) so the
+        precedence rule is ontology+inference driven everywhere."""
+        if obs.certainty != Certainty.CONFIRMED or not obs.key:
+            return []
+        intents: List[TransitionIntent] = []
+        evidence = [f"{obs.event_id}:{obs.observation_index}"]
+        for s in states:
+            if s.status in StateStatus.TERMINAL:
+                continue
+            if s.certainty in (Certainty.INFERRED, Certainty.ESTIMATED) and s.key == obs.key:
+                if obs.observed_at < s.last_observed_at:
+                    continue
+                intents.append(
+                    TransitionIntent(
+                        action=IntentAction.UPDATE,
+                        reason="R9 explicit user description supersedes inference",
+                        evidence=evidence,
+                        target_state_id=s.state_id,
+                        target_category=s.category,
+                        target_key=s.key,
+                        certainty=Certainty.CONFIRMED,
+                        value=obs.value or s.value,
+                    )
+                )
+        return intents
 
     # -- phase 1 slice: interaction → awake -----------------------------------
 
@@ -225,6 +264,9 @@ class InferenceEngine:
                     target_category=plan.category,
                     target_key=plan.key,
                     status=StateStatus.CANCELLED,
+                    # "" = no certainty change (the TransitionIntent default
+                    # is 'observed' and must never leak into canonical state)
+                    certainty="",
                     relevant_until=self._now() + timedelta(
                         hours=lifecycle.CANCEL_RELEVANT_HOURS
                     ),
@@ -284,6 +326,10 @@ class InferenceEngine:
                 return intents
             # re-affirm without semantic change: no intents (pure touch)
         else:
+            # NOTE: terminal (completed/cancelled) plans are invisible here
+            # (states = non-terminal only); the equal-timestamp resurrection
+            # guard lives in the Reconciler (_is_stale_creation consults the
+            # store across ALL statuses).
             _, valid_until, relevant_until = lifecycle.semantic_window(
                 obs.time_expression, obs.observed_at, self._now()
             )
@@ -293,26 +339,6 @@ class InferenceEngine:
                     "plan created (PLAN_LIFECYCLE)",
                 )
             )
-
-        # R9 (evidence precedence): explicit CONFIRMED language upgrades an
-        # inferred/estimated state of the same key.
-        if obs.certainty == Certainty.CONFIRMED:
-            for s in states:
-                if s.status in StateStatus.TERMINAL:
-                    continue
-                if s.certainty in (Certainty.INFERRED, Certainty.ESTIMATED) and s.key == obs.key:
-                    intents.append(
-                        TransitionIntent(
-                            action=IntentAction.UPDATE,
-                            reason="R9 explicit user description supersedes inference",
-                            evidence=evidence,
-                            target_state_id=s.state_id,
-                            target_category=s.category,
-                            target_key=s.key,
-                            certainty=Certainty.CONFIRMED,
-                            value=obs.value or s.value,
-                        )
-                    )
         return intents
 
     def _infer_plan_completion(
@@ -332,6 +358,7 @@ class InferenceEngine:
                 target_category=plan.category,
                 target_key=plan.key,
                 status=StateStatus.COMPLETED,
+                certainty="",  # no certainty change (see CANCEL intent)
             )
         ]
 
@@ -371,6 +398,7 @@ class InferenceEngine:
                         target_category=symptom.category,
                         target_key=symptom.key,
                         status=StateStatus.RESOLVED,
+                        certainty="",  # no certainty change (see CANCEL intent)
                         followup_relevant=False,
                     )
                 )
@@ -384,16 +412,32 @@ class InferenceEngine:
                         target_category=symptom.category,
                         target_key=symptom.key,
                         status=StateStatus.IMPROVING,
+                        certainty="",  # no certainty change (see CANCEL intent)
                     )
                 )
             return intents
 
-        # symptom create / re-affirm active
+        # symptom create / re-affirm active. NOTE: terminal (resolved)
+        # episodes are invisible here (states = non-terminal only); the
+        # equal-timestamp resurrection guard lives in the Reconciler
+        # (_is_stale_creation consults the store across ALL statuses).
         existing = self._latest_health_for_key(states, obs.key)
         if existing is not None:
             if obs.observed_at < existing.last_observed_at:
                 return intents  # stale: newer evidence owns this key
             if existing.status in (StateStatus.ACTIVE, StateStatus.IMPROVING):
+                # R9 merged into the re-affirm (V2 §22): an explicit
+                # CONFIRMED claim also upgrades an inferred/estimated symptom
+                # of the same key. A separate second UPDATE for the same
+                # state would be dropped by the executor's same-observation
+                # idempotency guard, so the upgrade rides this intent.
+                # certainty="" = no change (the TransitionIntent default is
+                # 'observed' and must never leak into canonical state).
+                upgrade = (
+                    obs.certainty == Certainty.CONFIRMED
+                    and existing.certainty
+                    in (Certainty.INFERRED, Certainty.ESTIMATED)
+                )
                 intents.append(
                     TransitionIntent(
                         action=IntentAction.UPDATE,
@@ -403,6 +447,7 @@ class InferenceEngine:
                         target_category=existing.category,
                         target_key=existing.key,
                         status=StateStatus.ACTIVE,
+                        certainty=Certainty.CONFIRMED if upgrade else "",
                         followup_relevant=True,
                     )
                 )

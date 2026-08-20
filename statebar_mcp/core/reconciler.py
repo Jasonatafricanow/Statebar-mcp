@@ -90,7 +90,12 @@ class Reconciler:
         - replaying the SAME observation (already applied) must not create a
           duplicate state. Consults the store (ALL statuses, including
           terminal), because a completed/cancelled state is exactly what
-          must not be rolled back."""
+          must not be rolled back;
+        - a DIFFERENT observation at the SAME-or-later semantic time already
+          owns the key — creation is refused even when the observation is
+          not a flagged replay (the async worker re-extracts an earlier
+          event at the original semantic time and must not resurrect a
+          terminal state — D8 acceptance flake regression)."""
         if not key:
             return False
         latest = self.store.get_latest_state_by_key(obs.subject_id, key)
@@ -98,14 +103,12 @@ class Reconciler:
             return False
         if latest.last_observation_key == self._obs_key(obs):
             return True  # this exact observation already applied
-        if obs.is_replay and latest.last_observed_at >= obs.observed_at:
-            # ambiguous legacy replay: a different observation at the same-or-
-            # later time already owns this key — do not create/resurrect.
-            return True
-        if latest.last_observed_at > obs.observed_at:
+        if latest.last_observed_at >= obs.observed_at:
             logger.debug(
-                "stale creation skipped: obs observed_at %s older than state %s last_observed %s",
-                obs.observed_at.isoformat(), latest.state_id, latest.last_observed_at.isoformat(),
+                "stale creation skipped: key %s owned by a different "
+                "observation at >= %s (this obs %s)",
+                key, latest.last_observed_at.isoformat(),
+                obs.observed_at.isoformat(),
             )
             return True
         return False
@@ -309,10 +312,14 @@ class Reconciler:
             return []
         states = self._active_states(obs.subject_id)
         intents, handled = self.inference.infer(obs, states)
-        if handled:
-            changed = self._execute_intents(obs, states, intents)
-        else:
+        changed: List[State] = []
+        if not handled:
+            # V1 fallback rules first: their order vs the R9 intents below
+            # preserves the historical "handler, then explicit supersede"
+            # sequence (_apply_r9 used to run after the handler).
             changed = self._apply_inner(obs, states)
+        if intents:
+            changed.extend(self._execute_intents(obs, states, intents))
         self.store.mark_observation_applied(
             obs.subject_id, obs.event_id, obs.observation_index
         )
@@ -505,9 +512,10 @@ class Reconciler:
         else:
             logger.info("unknown observation type %r: observation-only, no state mutation", obs.type)
 
-        # R9: an explicit user statement supersedes an inferred/estimated one.
-        if obs.certainty == Certainty.CONFIRMED and obs.key:
-            changed.extend(self._apply_r9(obs, states))
+        # R9 (evidence precedence) is now owned by the Inference Engine
+        # (_infer_r9, emitted for every observation type); the V1 generic
+        # handler was retired. apply() executes the R9 intents after this
+        # V1 fallback, preserving the historical ordering.
         return changed
 
     # -- R1 / R2 : the sleep/awake pair ---------------------------------------
@@ -599,29 +607,10 @@ class Reconciler:
         self._apply(new, self._transition(new, new.status, "R4 activity completed (recent)", obs))
         return [new]
 
-    # -- R9 : explicit user description supersedes inference -------------------------
-
-    def _apply_r9(self, obs: Observation, states: List[State]) -> List[State]:
-        changed: List[State] = []
-        for s in states:
-            if s.status in StateStatus.TERMINAL:
-                continue
-            if s.certainty in (Certainty.INFERRED, Certainty.ESTIMATED) and s.key == obs.key:
-                if obs.observed_at < s.last_observed_at:
-                    continue
-                if self._mutate(
-                    s, obs,
-                    certainty=Certainty.CONFIRMED,
-                    value=obs.value or s.value,
-                    reason="R9 explicit user description supersedes inference",
-                ):
-                    changed.append(s)
-        return changed
-
-
 # Plan observations (PLAN/CANCEL) and symptom observations (SYMPTOM/RESOLVE)
 # are owned by the Inference Engine (PLAN_LIFECYCLE / SYMPTOM_LIFECYCLE);
-# their V1 handlers were migrated and deleted.
+# their V1 handlers were migrated and deleted. R9 (evidence precedence) is
+# also inference-owned (_infer_r9, unified for every observation type).
 _RULE_HANDLERS: Dict[str, object] = {
     ObservationType.AWAKE: lambda rec, obs, states: rec._r1_awake(obs, states),
     ObservationType.SLEEP: lambda rec, obs, states: rec._r2_sleep(obs, states),

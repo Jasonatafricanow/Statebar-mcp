@@ -29,6 +29,7 @@ from statebar_mcp.core.models import (  # noqa: E402
     SourceType,
     State,
     StateStatus,
+    TimeExpr,
     TransitionIntent,
 )
 from statebar_mcp.core.service import UserStateService  # noqa: E402
@@ -730,3 +731,168 @@ class TestV2MigrationSymptoms:
         for name in ("_r_symptom_new", "_r7_improving", "_r8_resolved",
                      "_target_symptom", "_active_symptoms"):
             assert not hasattr(rec, name), f"V1 symptom handler {name} still present"
+
+
+class TestV2ResurrectionGuard:
+    """Terminal states must not be resurrected by equal-timestamp re-analysis.
+
+    The async worker re-extracts an earlier event at the SAME semantic time
+    as the resolving observation; without a strict-newer guard the re-analysis
+    re-ESTABLISHes the symptom/plan as a fresh ACTIVE episode (D8 acceptance
+    flake regression: symptom shows 'active' instead of resolved)."""
+
+    def _clock(self):
+        return FixedClock(local_dt(2026, 8, 16, 9, 0).astimezone(timezone.utc))
+
+    def _symptom_obs(self, key="stomach_pain", value="active",
+                     obs_type="symptom", observed=None, event_id="e1"):
+        return Observation(
+            subject_id="u", event_id=event_id, type=obs_type,
+            category="health", key=key, value=value,
+            source=Source(type="conversation"),
+            observed_at=observed or datetime.now(timezone.utc),
+            raw_payload="胃有点疼",
+        )
+
+    def _plan_obs(self, key="calligraphy", observed=None, event_id="e1"):
+        return Observation(
+            subject_id="u", event_id=event_id, type="plan",
+            category="planning", key=key, value=key,
+            certainty=Certainty.TENTATIVE, time_expression=TimeExpr.AFTERNOON,
+            source=Source(type="conversation"),
+            observed_at=observed or datetime.now(timezone.utc),
+            raw_payload="下午去写书法",
+        )
+
+    def _cancel_obs(self, key="calligraphy", observed=None, event_id="e2"):
+        return Observation(
+            subject_id="u", event_id=event_id, type="cancel",
+            category="planning", key=key, value="",
+            source=Source(type="conversation"),
+            observed_at=observed or datetime.now(timezone.utc),
+            raw_payload="不去了",
+        )
+
+    def test_symptom_not_resurrected_by_same_timestamp_reanalysis(self):
+        clock = self._clock()
+        service, store = make_service(clock=clock)
+        try:
+            rec = service.reconciler
+            rec.apply(self._symptom_obs(observed=clock(), event_id="e1"))
+            rec.apply(self._symptom_obs(
+                value="resolved", obs_type="resolve", key="stomach_pain",
+                observed=clock(), event_id="e2",
+            ))
+            # async worker re-analysis of e1 with the SAME semantic time
+            rec.apply(self._symptom_obs(observed=clock(), event_id="e1-reanalysis"))
+            rows = [s for s in store.get_states("u") if s.key == "stomach_pain"]
+            assert len(rows) == 1, "resolved symptom was resurrected"
+            assert rows[0].status == StateStatus.RESOLVED
+        finally:
+            service.close()
+
+    def test_symptom_strictly_newer_claim_opens_new_episode(self):
+        """The guard is strict-newer, not a blanket ban: a genuinely later
+        symptom claim still opens a new episode (same-timestamp ones don't)."""
+        clock = self._clock()
+        service, store = make_service(clock=clock)
+        try:
+            rec = service.reconciler
+            rec.apply(self._symptom_obs(observed=clock(), event_id="e1"))
+            rec.apply(self._symptom_obs(
+                value="resolved", obs_type="resolve", key="stomach_pain",
+                observed=clock(), event_id="e2",
+            ))
+            clock.set(local_dt(2026, 8, 16, 12, 0).astimezone(timezone.utc))
+            rec.apply(self._symptom_obs(observed=clock(), event_id="e3"))
+            rows = [s for s in store.get_states("u") if s.key == "stomach_pain"]
+            assert {s.status for s in rows} == {StateStatus.RESOLVED, StateStatus.ACTIVE}
+        finally:
+            service.close()
+
+    def test_plan_not_resurrected_by_same_timestamp_reanalysis(self):
+        clock = self._clock()
+        service, store = make_service(clock=clock)
+        try:
+            rec = service.reconciler
+            rec.apply(self._plan_obs(observed=clock(), event_id="e1"))
+            rec.apply(self._cancel_obs(observed=clock(), event_id="e2"))
+            # async worker re-analysis of e1 with the SAME semantic time
+            rec.apply(self._plan_obs(observed=clock(), event_id="e1-reanalysis"))
+            rows = [s for s in store.get_states("u") if s.key == "calligraphy"]
+            assert len(rows) == 1, "cancelled plan was resurrected"
+            assert rows[0].status == StateStatus.CANCELLED
+        finally:
+            service.close()
+
+
+class TestV2R9EvidencePrecedence:
+    """R9 migration (V2 §22): the explicit-supersedes-inference rule is now a
+    unified Inference Engine step for EVERY observation type; the V1 generic
+    handler (_apply_r9) is gone."""
+
+    def test_r9_intents_emitted_for_unowned_observation(self):
+        from statebar_mcp.core.inference import InferenceEngine
+
+        clock = FixedClock(local_dt(2026, 8, 16, 9, 0).astimezone(timezone.utc))
+        engine = InferenceEngine(now_fn=clock)
+        inferred = State(
+            subject_id="u", category="sleep", key="awake",
+            status=StateStatus.ACTIVE, certainty=Certainty.INFERRED,
+            value="awake", last_observed_at=clock(),
+        )
+        obs = Observation(
+            subject_id="u", event_id="e1", type="state",
+            category="sleep", key="awake", value="awake",
+            certainty=Certainty.CONFIRMED,
+            source=Source(type="conversation"),
+            observed_at=clock(), raw_payload="x",
+        )
+        intents, handled = engine.infer(obs, [inferred])
+        assert handled is False, "state-type observations stay V1-owned"
+        r9 = [i for i in intents if i.action == IntentAction.UPDATE
+              and i.certainty == Certainty.CONFIRMED]
+        assert r9, "R9 upgrade intent missing for unowned observation"
+
+    def test_symptom_confirm_upgrades_inferred_certainty(self):
+        """A CONFIRMED symptom claim upgrades an inferred symptom of the same
+        key (restores the pre-migration R9 coverage for symptoms)."""
+        clock = FixedClock(local_dt(2026, 8, 16, 9, 0).astimezone(timezone.utc))
+        service, store = make_service(clock=clock)
+        try:
+            rec = service.reconciler
+            # legacy/derived INFERRED symptom row (inference itself always
+            # creates symptoms CONFIRMED, so inject the old-style row like
+            # migrated data would look)
+            legacy = State(
+                subject_id="u", category="health", key="stomach_pain",
+                value="active", status=StateStatus.ACTIVE,
+                certainty=Certainty.INFERRED,
+                valid_from=clock(),
+                valid_until=clock() + timedelta(hours=12),
+                relevant_until=clock() + timedelta(hours=12),
+                last_observed_at=clock(),
+            )
+            store.insert_state(legacy)
+            assert store.get_state("u", "health", "stomach_pain").certainty == Certainty.INFERRED
+            clock.set(local_dt(2026, 8, 16, 9, 30).astimezone(timezone.utc))
+            rec.apply(Observation(
+                subject_id="u", event_id="e2", type="symptom",
+                category="health", key="stomach_pain", value="active",
+                certainty=Certainty.CONFIRMED,
+                source=Source(type="conversation"),
+                observed_at=clock(), raw_payload="x",
+            ))
+            symptom = store.get_state("u", "health", "stomach_pain")
+            assert symptom.certainty == Certainty.CONFIRMED
+        finally:
+            service.close()
+
+    def test_v1_r9_handler_removed(self):
+        """Migration acceptance: the V1 generic R9 handler is gone."""
+        from statebar_mcp.core import reconciler as reconciler_mod
+        from statebar_mcp.core.reconciler import Reconciler
+
+        rec = Reconciler(SQLiteStore(":memory:"))
+        assert not hasattr(rec, "_apply_r9"), "V1 _apply_r9 still present"
+        assert not hasattr(reconciler_mod, "_apply_r9")

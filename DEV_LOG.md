@@ -218,3 +218,42 @@
 - 删除 `lifecycle.py.bak-20260818`（变更已入 git）。
 - 全量测试：本机 97 passed（本环境沙箱阻断 12 项 tmp_path/子进程用例，非代码回归；
   常规环境全量 109 项通过）。
+
+## 2026-08-20 · 复评第六轮：D8 异步重抽取竞态修复 + R9 证据优先级统一迁移
+
+### 1. [fix] D8 验收竞态（async worker 重抽取降级/复活状态）
+
+复现：D8 约 1/3 随机失败（症状在 resolve 后仍显示 active）。根因是异步 worker 对
+已同步事件的持久化重抽取携带事件原始语义时间、以同 event_id 迟到到达：
+
+- 症状被 e8 置 IMPROVING 后，e7 的重抽取（e7:2，同为 9:00）走 re-affirm 把它降回
+  ACTIVE；若已 RESOLVED 则走 ESTABLISH 复活新 episode。修复两层：
+- `reconciler._is_stale_creation`：把「仅 replay 标记才拦截等时间戳」放宽为
+  「任何 observation 在同一或更晚语义时间已被不同 observation 占有该 key 即拒绝
+  创建/复活」（等时间戳的异步重抽取同样拦截，含非 replay 场景）。
+- `service._process_async`：worker 新抽取的 observation 在 store 重载后重新打
+  is_replay 标记（瞬态字段不随重载保留）——迟到分析套用严格同/晚时间戳占有规则，
+  re-affirm/UPDATE 不再能把状态降级或复活。
+- D8 压测 15/15 通过（修复前 4-8/15 失败）。回归测试：TestV2ResurrectionGuard×3
+  （症状/计划等时间戳重分析不复活；严格更新的新声明仍开新 episode）。
+
+### 2. [迁移] R9 显式语言优先 → inference 统一证据优先级（V2 §22）
+
+- 新增 `InferenceEngine._infer_r9`：任何 CONFIRMED 且带 key 的 observation 都会
+  对同 key 的 INFERRED/ESTIMATED 非终态状态发 UPDATE 升级 intent（与原 V1
+  `_apply_r9` 守卫一致）；`infer()` 对所有分支（interaction/plan/symptom/
+  activity/未接管）统一追加。
+- `reconciler.apply()` 从「owned→intents / 非 owned→V1」二选一改为双路径：
+  非 owned 先跑 V1 fallback，再执行 intents（保持「handler 后显式 supersede」
+  的历史顺序）。
+- 删除 V1 `_apply_r9` 及其调用；`_infer_plan` 内部 R9 块并入统一规则。
+- 顺带修复 round5 潜在 bug：UPDATE 类 intent 未显式设 certainty 时，dataclass
+  默认值 'observed' 会被写入 canonical state（cancel/resolve/complete/re-affirm
+  全部中招）——这些 intent 现在显式 `certainty=""`（既有约定：空串=不改）；
+  symptom re-affirm 在 CONFIRMED 声明下合并 R9 升级。
+- 迁移验收：TestV2R9EvidencePrecedence×3（未接管 observation 的 R9 intent、
+  CONFIRMED 症状升级 INFERRED certainty、V1 `_apply_r9` 已删除）。
+- 全套 **116 passed = 110 基线 + 新增 6**（R10 1 + ResurrectionGuard 3 + R9 3），
+  0 failures；V1 D1-D12/安全/MCP stdio 全部保持绿。
+- 剩余 V1：R1/R2（显式睡眠/清醒语言，P3 测试钉死 V1 所有权）、R4 活动半部、
+  R10（lazy_expire 窗口机制）、S1/S2 系统规则。
