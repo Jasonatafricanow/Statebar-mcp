@@ -147,6 +147,31 @@ class TestLifecycle:
         assert active.status == StateStatus.ACTIVE
         assert len(transitions) == 1
 
+    def test_lazy_expire_expires_active_and_improving_after_window(self):
+        # R10 (2026-08-18): ACTIVE/IMPROVING states are no longer exempt from
+        # lazy expiration — every state with a passed valid_until is stale
+        # (hunger/headache/hangover symptoms used to stay active forever).
+        now = local_dt(2026, 8, 16, 8, 0)
+        awake = State(
+            subject_id="u", category="sleep", key="awake",
+            status=StateStatus.ACTIVE,
+            valid_until=local_dt(2026, 8, 16, 10, 0),  # 12h TTL exceeded
+            last_observed_at=now,
+        )
+        improving = State(
+            subject_id="u", category="health", key="headache",
+            status=StateStatus.IMPROVING,
+            valid_until=local_dt(2026, 8, 16, 9, 0),
+            last_observed_at=now,
+        )
+        transitions, mutated = lazy_expire(
+            [awake, improving], local_dt(2026, 8, 16, 12, 0)
+        )
+        assert awake.status == StateStatus.EXPIRED
+        assert improving.status == StateStatus.EXPIRED
+        assert len(transitions) == 2
+        assert all(t.to_status == StateStatus.EXPIRED for t in transitions)
+
 
 # ---------------------------------------------------------------------------
 # Reconciler ruleset

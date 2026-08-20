@@ -202,3 +202,19 @@
 - §10 R1-R10/S1-S2 → reconciler.py（每规则有独立 handler + 单元测试）
 - §13 四表 → store.py
 - §15 D1-D12 → tests/test_acceptance_d.py
+
+## 2026-08-20 · R10 收尾：ACTIVE/IMPROVING 惰性过期语义定义
+
+按 2026-08-16 review P2 记录（sleeping 永不被 TTL 过期）与 V2 第二阶段迁移清单 R10 行
+（"ACTIVE 状态的 TTL 语义要定义清楚"）落地：
+
+- `lifecycle.lazy_expire` 从「只处理 TENTATIVE/PLANNED/PENDING」改为「除 EXPIRED 外
+  所有带 valid_until 的状态，窗口过后一律惰性过期」——hunger/headache/hangover 等
+  症状不再永久 active（SYMPTOM_LIFECYCLE 由 observation 驱动解决，TTL 为次级兜底）；
+  sleeping/awake 的 TTL（12h/16h）同样生效，interaction 仍是 sleeping 的主消除器
+  （V2 切片行为不变）。
+- 新增回归测试 `test_lazy_expire_expires_active_and_improving_after_window`
+  （旧代码下会失败：ACTIVE/IMPROVING 永不过期）。
+- 删除 `lifecycle.py.bak-20260818`（变更已入 git）。
+- 全量测试：本机 97 passed（本环境沙箱阻断 12 项 tmp_path/子进程用例，非代码回归；
+  常规环境全量 109 项通过）。

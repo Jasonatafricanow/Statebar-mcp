@@ -105,7 +105,10 @@ def lazy_expire(states: List[State], now: datetime) -> Tuple[List[StateTransitio
     transitions: List[StateTransition] = []
     mutated: List[State] = []
     for state in states:
-        if state.status not in (StateStatus.TENTATIVE, StateStatus.PLANNED, StateStatus.PENDING):
+        # R10 fix (2026-08-18): ACTIVE/IMPROVING states were never expired because
+        # this filter skipped them — hunger/headache/hangover symptoms stayed active
+        # forever. TTL/semantic windows apply to every status with a valid_until.
+        if state.status in (StateStatus.EXPIRED,):
             continue
         if state.valid_until is not None and state.valid_until < now:
             transitions.append(
