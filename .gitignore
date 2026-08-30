@@ -8,3 +8,6 @@ user_state.db
 user_state.db-shm
 user_state.db-wal
 .venv/
+
+# Mimosa security hook state
+.mimosa/
