@@ -132,6 +132,7 @@ def _parse_llm_json(content: str, request: ObserveRequest) -> List[Observation]:
         request.source,
         request.observed_at,
         start_index=0,
+        source_text=request.text,
     )
     if isinstance(payload, list) and payload and not observations:
         logger.warning(
@@ -246,5 +247,6 @@ class MockExtractor(PersistentExtractor):
                     request.source,
                     request.observed_at,
                     start_index=0,
+                    source_text=request.text,
                 )
         return []
