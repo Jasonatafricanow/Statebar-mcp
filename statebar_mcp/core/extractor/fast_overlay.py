@@ -49,8 +49,18 @@ _AWAKE_PATTERNS = [
 ]
 
 _SLEEP_PATTERNS = [
-    re.compile(r"准备睡(?:觉)?|要睡(?:觉)?了|去睡(?:觉)?了|困了.{0,6}睡"),
-    re.compile(r"睡(?:觉)?了|躺下了|睡了"),
+    # Fast Overlay is a high-confidence path: only admit an explicit,
+    # sentence-level current self sleep transition.  Do not fire on mentions
+    # such as "睡眠记录", "为什么系统显示我睡了", "我没说我睡了",
+    # quotations, or historical duration reports.
+    re.compile(
+        r"(?:^|[，,。！？!?\\s])(?:我)?(?:准备|要|去)睡(?:觉)?了?"
+        r"(?=$|[，,。！？!?\\s])"
+    ),
+    re.compile(
+        r"(?:^|[，,。！？!?\\s])(?:我)?(?:已经)?睡(?:觉)?了"
+        r"(?=$|[，,。！？!?\\s])"
+    ),
 ]
 
 _CANCEL_PATTERNS = [
