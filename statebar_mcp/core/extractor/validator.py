@@ -62,6 +62,71 @@ _VALID_TYPES = ObservationType.ALL
 _VALID_CERTAINTIES = Certainty.ALL
 _VALID_TIME = TimeExpr.ALL
 
+# Current sleep/wake state is high-impact and easy to corrupt through keyword
+# mention.  Admission therefore requires lexical evidence in the authoritative
+# user message, not merely a model-proposed ontology key/value.
+_SLEEP_ASSERTION_PATTERNS = [
+    re.compile(
+        r"(?:^|[，,。！？!?\\s])(?:我)?(?:准备|要|去)睡(?:觉)?了?"
+        r"(?=$|[，,。！？!?\\s])"
+    ),
+    re.compile(
+        r"(?:^|[，,。！？!?\\s])(?:我)?(?:已经)?睡(?:觉)?了"
+        r"(?=$|[，,。！？!?\\s])"
+    ),
+]
+_AWAKE_ASSERTION_PATTERNS = [
+    re.compile(
+        r"(?:^|[，,。！？!?\\s])(?:我)?(?:刚睡醒|刚醒(?:了|过来)?|睡醒了|刚起床|一觉醒来)"
+        r"(?=$|[，,。！？!?\\s])"
+    ),
+    re.compile(
+        r"(?:^|[，,。！？!?\\s])(?:我)?(?:现在)?醒着"
+        r"(?=$|[，,。！？!?\\s])"
+    ),
+]
+
+
+def _has_any(patterns, text: str) -> bool:
+    return any(p.search(text) for p in patterns)
+
+
+def _semantic_admission_ok(
+    obs_type: str,
+    category: str,
+    key: str,
+    value: str,
+    source_text: str,
+) -> bool:
+    """Conservative truth gate for current sleep/wake observations.
+
+    Mentioning a state name, questioning it, describing an app/history, or
+    asking why a field exists is not evidence that the state is true.  For
+    this high-impact domain we require an explicit current-state assertion in
+    the authoritative user message.
+    """
+    sleep_domain = (
+        category == "sleep"
+        or obs_type in (ObservationType.SLEEP, ObservationType.AWAKE)
+        or key in ("sleep", "sleeping", "awake")
+    )
+    if not sleep_domain:
+        return True
+    if not source_text:
+        return False
+
+    wants_awake = obs_type == ObservationType.AWAKE or key == "awake"
+    wants_sleep = obs_type == ObservationType.SLEEP or key in ("sleep", "sleeping")
+
+    if wants_awake:
+        return _has_any(_AWAKE_ASSERTION_PATTERNS, source_text)
+    if wants_sleep:
+        return _has_any(_SLEEP_ASSERTION_PATTERNS, source_text)
+
+    # Unknown sleep-domain state shapes are observation-only noise, not
+    # canonical evidence.
+    return False
+
 
 def normalize_key(raw: Any, fallback_type: str, text: str) -> str:
     raw = str(raw or "").strip()
@@ -87,6 +152,7 @@ def validate_observation(
     source: Source,
     observed_at,
     index: int,
+    source_text: str = "",
 ) -> Optional[Observation]:
     if not isinstance(raw, dict):
         return None
@@ -95,16 +161,27 @@ def validate_observation(
     if obs_type not in _VALID_TYPES:
         return None
 
-    certainty = str(raw.get("certainty", "confirmed")).strip().lower()
+    certainty_raw = raw.get("certainty")
+    if certainty_raw is None:
+        return None
+    certainty = str(certainty_raw).strip().lower()
     if certainty not in _VALID_CERTAINTIES:
-        certainty = Certainty.CONFIRMED
+        return None
 
     time_expr = str(raw.get("time_expression", TimeExpr.UNSPECIFIED)).strip().lower()
     if time_expr not in _VALID_TIME:
         time_expr = TimeExpr.UNSPECIFIED
 
-    text = str(raw.get("raw_payload", "") or "")
+    # Never trust model-supplied raw_payload as evidence.  The caller owns the
+    # authoritative user message; model text is only a fallback for direct
+    # validator callers/tests that do not provide source_text.
+    text = str(source_text or raw.get("raw_payload", "") or "")
     key = normalize_key(raw.get("key"), obs_type, text)
+    category = str(raw.get("category", "") or "").strip()
+    value = str(raw.get("value", "") or "").strip()
+
+    if not _semantic_admission_ok(obs_type, category, key, value, text):
+        return None
 
     try:
         confidence = float(raw.get("confidence", 1.0))
@@ -117,9 +194,9 @@ def validate_observation(
         event_id=event_id,
         observation_index=index,
         type=obs_type,
-        category=str(raw.get("category", "") or "").strip(),
+        category=category,
         key=key,
-        value=str(raw.get("value", "") or "").strip(),
+        value=value,
         certainty=certainty,
         time_expression=time_expr,
         source=source,  # provenance is caller-owned, never LLM-owned
@@ -136,13 +213,22 @@ def validate_observations(
     source: Source,
     observed_at,
     start_index: int = 0,
+    source_text: str = "",
 ) -> List[Observation]:
     """Validate an LLM payload (list of dicts) into Observations."""
     if not isinstance(payload, list):
         return []
     out: List[Observation] = []
     for i, item in enumerate(payload):
-        obs = validate_observation(item, subject_id, event_id, source, observed_at, start_index + i)
+        obs = validate_observation(
+            item,
+            subject_id,
+            event_id,
+            source,
+            observed_at,
+            start_index + i,
+            source_text=source_text,
+        )
         if obs is not None:
             out.append(obs)
     return out
@@ -177,6 +263,13 @@ Rules (hard):
 5. "我刚睡醒" -> type awake, key awake. "我要睡了" -> type sleep, key sleeping, value preparing_sleep.
 6. Every observation must carry the original sentence in raw_payload.
 7. If nothing state-worthy, output [].
+8. Mention is NOT assertion. A state word used as a topic, field name, quoted
+   text, correction, negation, historical record, app feature, or question is
+   not evidence that the state is currently true.
+9. For sleep/awake, emit an observation only when the user explicitly states
+   their own current transition/state (e.g. "我要睡了", "我刚睡醒"). Never infer
+   current sleep from "睡眠记录", "为什么还有 sleeping", "我没说我睡了",
+   "昨天睡了三个小时", or quoted/reported speech.
 
 Examples:
 Input: "下午可能去写书法"
@@ -187,6 +280,19 @@ Output: [{"type":"activity","category":"activity","key":"swimming","value":"comp
 
 Input: "晚点去写书法，吃完饭以后"
 Output: [{"type":"plan","category":"planning","key":"calligraphy","value":"rescheduled after dinner","certainty":"planned","time_expression":"tonight","confidence":0.9,"raw_payload":"晚点去写书法，吃完饭以后"}]
+
+
+Input: "我做过一个记录心情和睡眠的 App"
+Output: []
+
+Input: "我状态里为什么还有 sleeping"
+Output: []
+
+Input: "我没说我睡了"
+Output: []
+
+Input: "昨天只睡了三个小时"
+Output: []
 """
 
 
