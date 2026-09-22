@@ -20,8 +20,8 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
-from . import lifecycle, ontology
-from .inference import InferenceEngine
+from . import lifecycle, state_rules
+from .inference import TransitionPlanner
 from .models import (
     Certainty,
     IntentAction,
@@ -50,7 +50,7 @@ class Reconciler:
     def __init__(self, store: SQLiteStore, now_fn=utc_now, inference=None):
         self.store = store
         self._now_fn = now_fn
-        self.inference = inference or InferenceEngine(now_fn=now_fn)
+        self.inference = inference or TransitionPlanner(now_fn=now_fn)
 
     def _now(self) -> datetime:
         return self._now_fn()
@@ -338,7 +338,7 @@ class Reconciler:
                 target = self._intent_target(states, intent)
                 if target is None:
                     continue  # already gone (e.g. replayed) — nothing to do
-                # Transition legality gate (ontology.validate_transition):
+                # Transition legality gate (state_rules.validate_transition):
                 # every status change goes through the declared lifecycle
                 # BEFORE any write (V2 §13). Illegal hops are rejected as a
                 # whole — the intent is dropped, the state is untouched.
@@ -443,7 +443,7 @@ class Reconciler:
         """V2 §13 transition legality gate (ontology-driven). Conservative:
         transitions not covered by any declared lifecycle of the state's
         category are rejected before the write."""
-        if ontology.validate_transition(state, to_status):
+        if state_rules.validate_transition(state, to_status):
             return True
         logger.warning(
             "intent %s rejected by transition legality gate: %s/%s %s -> %s",
