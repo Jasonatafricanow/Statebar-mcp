@@ -1,4 +1,4 @@
-"""Inference Engine (V2 §7-§9).
+"""Plan state transitions from observations and current state.
 
 Input : Observation + current Canonical State + Ontology + time
 Output: TransitionIntent[] — never writes the database.
@@ -31,7 +31,7 @@ import logging
 from datetime import timedelta
 from typing import List, Optional, Tuple
 
-from . import lifecycle, ontology
+from . import lifecycle, state_rules
 from .models import (
     Certainty,
     IntentAction,
@@ -53,7 +53,7 @@ AWAKE_CONFIRMED = "awake_confirmed"
 _PLAN_STATUSES = (StateStatus.TENTATIVE, StateStatus.PLANNED, StateStatus.PENDING)
 
 
-class InferenceEngine:
+class TransitionPlanner:
     """Produces TransitionIntents from observations. Stateless and
     side-effect free (pure function over its inputs + injected clock)."""
 
@@ -78,7 +78,7 @@ class InferenceEngine:
         # for EVERY observation type, owned by inference or not; the V1
         # generic handler was retired.
         r9 = self._infer_r9(obs, states)
-        if ontology.is_interaction_observation(obs):
+        if state_rules.is_interaction_observation(obs):
             return self._infer_interaction(obs, states) + r9, True
         if obs.type in (ObservationType.PLAN, ObservationType.CANCEL):
             return self._infer_plan(obs, states) + r9, True
@@ -477,4 +477,4 @@ class InferenceEngine:
         matches = [s for s in states if s.category == "health" and s.key == key]
         if not matches:
             return None
-        return max(matches, key=lambda s: s.updated_at)
+        return max(matches, key=lambda s: s.updated_at)\n\n# Backward compatibility for existing callers/tests.\nInferenceEngine = TransitionPlanner\n
