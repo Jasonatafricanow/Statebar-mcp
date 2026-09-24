@@ -143,6 +143,13 @@ Regression coverage includes:
 - replay/idempotency;
 - MCP and REST behavior.
 
+## Development history
+
+The original development log is retained under
+[`docs/history/DEV_LOG.md`](docs/history/DEV_LOG.md) as dated historical evidence. It is
+not current architecture authority; several V1/V2 names in that log predate the current
+simplification.
+
 ## Scope
 
 Statebar is intentionally narrow. It is not a long-term memory database, planner, health application, or full agent runtime.

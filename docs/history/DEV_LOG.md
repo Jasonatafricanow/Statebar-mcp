@@ -1,4 +1,10 @@
-# DEV_LOG — statebar-mcp
+# Historical Development Log — Statebar MCP
+
+> **History only.** This file preserves development chronology and earlier V1/V2
+> terminology. It is not current architecture authority. For current behavior use
+> `README.md`, current source/tests, `SECURITY.md`, and CI. Historical labels such as
+> "唯一准绳", V1/V2 ownership notes, test counts and deployment observations below should
+> be read in their dated context.
 
 > 现场开发日志（个人机器上的部署细节不入公开仓库）。
 > 派单来源：对话状态栏计划V1-派单总纲 v1.1（应用层语义冻结，唯一准绳）。
