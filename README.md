@@ -126,6 +126,29 @@ Optional LLM extraction is disabled unless configured. If enabled, raw user text
 
 REST defaults to loopback. Non-loopback binding requires an authentication token.
 
+## Bounded completeness
+
+Statebar stays small because it owns only short-lived current-state reconciliation.
+
+Its complete contract is narrower than a memory or agent runtime:
+
+```text
+interaction evidence
+-> observation candidate
+-> semantic/source admission
+-> deterministic reconciliation
+-> current state + transition history
+-> bounded snapshot
+```
+
+Long-term memory, planning, general cognition, tool execution and agent orchestration are
+explicitly outside the service. Adding those capabilities would not make this state layer
+more complete; it would give it authority that belongs elsewhere.
+
+The useful evidence is therefore the transition semantics—stale-event handling, provenance,
+assistant-message exclusion, replay/idempotency, lifecycle rules and transport behavior—not
+the amount of code wrapped around them.
+
 ## Verification
 
 ```bash
