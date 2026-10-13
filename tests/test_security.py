@@ -126,6 +126,76 @@ class TestRESTAuth:
             srv.shutdown(); srv.server_close(); service.close()
 
 
+def _raw_request(port, method, path, headers, body=b""):
+    import http.client
+
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    try:
+        conn.request(method, path, body=body, headers=headers)
+        resp = conn.getresponse()
+        return resp.status, resp.read().decode("utf-8")
+    finally:
+        conn.close()
+
+
+class TestBrowserForgery:
+    """Tokenless loopback mode must not be reachable from a web page."""
+
+    OBSERVE = json.dumps({
+        "subject_id": "u", "event_id": "forged", "text": "头疼得厉害，我要睡了",
+        "source": {"type": "interaction"},
+    }).encode("utf-8")
+
+    def test_cross_origin_text_plain_post_rejected(self):
+        service, srv, port, thread = _make_server()
+        try:
+            code, _ = _raw_request(port, "POST", "/v1/observe", {
+                "Content-Type": "text/plain",
+                "Origin": "https://evil.example",
+            }, self.OBSERVE)
+            assert code == 403
+            # nothing was admitted
+            code, body = _get(port, "/v1/state?subject_id=u")
+            assert code == 200 and body["states"] == []
+        finally:
+            srv.shutdown(); srv.server_close(); service.close()
+
+    def test_text_plain_without_origin_rejected(self):
+        service, srv, port, thread = _make_server()
+        try:
+            code, _ = _raw_request(port, "POST", "/v1/observe",
+                                   {"Content-Type": "text/plain"}, self.OBSERVE)
+            assert code == 415
+        finally:
+            srv.shutdown(); srv.server_close(); service.close()
+
+    def test_dns_rebinding_host_rejected(self):
+        service, srv, port, thread = _make_server()
+        try:
+            code, _ = _raw_request(port, "GET", "/v1/state?subject_id=u",
+                                   {"Host": f"attacker.example:{port}"})
+            assert code == 403
+            code, _ = _raw_request(port, "GET", "/v1/health",
+                                   {"Host": f"localhost:{port}"})
+            assert code == 200
+            code, _ = _raw_request(port, "GET", "/v1/health", {"Host": f"[::1]:{port}"})
+            assert code == 200
+        finally:
+            srv.shutdown(); srv.server_close(); service.close()
+
+    def test_token_mode_allows_browser_clients(self):
+        service, srv, port, thread = _make_server(auth_token="sekrit")
+        try:
+            code, _ = _raw_request(port, "GET", "/v1/health", {
+                "Authorization": "Bearer sekrit",
+                "Origin": "https://dashboard.example",
+                "Host": "statebar.internal",
+            })
+            assert code == 200
+        finally:
+            srv.shutdown(); srv.server_close(); service.close()
+
+
 class TestFailClosedCLI:
     def test_non_loopback_without_token_refused(self, tmp_path, monkeypatch):
         import os
