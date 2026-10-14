@@ -14,6 +14,9 @@ Security (fail-closed):
   address without an auth token (``DSH_USER_STATE_SERVE_TOKEN``).
 - When a token is configured, EVERY endpoint — including /v1/health —
   requires ``Authorization: Bearer <token>`` (constant-time compare).
+- Without a token, requests carrying ``Origin`` or a non-loopback ``Host``
+  are refused (blocks cross-site requests and DNS rebinding), and POST
+  bodies must be ``application/json`` (no preflight-free browser forms).
 - Request bodies are capped (default 64 KiB → 413).
 """
 
@@ -83,6 +86,30 @@ class _Handler(BaseHTTPRequestHandler):
         if scheme.lower() != "bearer" or not provided:
             return False
         return hmac.compare_digest(provided.strip(), self.auth_token)
+
+    def _browser_guard(self) -> Optional[Tuple[int, str]]:
+        """Reject requests a web page could have forged.
+
+        Without a token, "loopback" is the only access control — and a browser
+        on this machine is on loopback. Any page the user visits can then send
+        a no-preflight ``text/plain`` POST here, or rebind its own hostname to
+        127.0.0.1 and read responses. Browsers always attach ``Origin`` to
+        cross-origin requests and keep the attacker's hostname in ``Host``,
+        while local CLI/SDK clients send neither, so tokenless mode rejects
+        both. With a token, a forged request cannot carry ``Authorization``.
+        """
+        if self.auth_token:
+            return None
+        if self.headers.get("Origin") is not None:
+            return 403, "cross-origin requests are not allowed without an auth token"
+        host = (self.headers.get("Host") or "").strip().lower()
+        if host.startswith("["):
+            hostname = host[1:].partition("]")[0]
+        else:
+            hostname = host.rpartition(":")[0] if host.count(":") == 1 else host
+        if not _is_loopback(hostname):
+            return 403, "Host header must be a loopback address without an auth token"
+        return None
 
     def _drain_request_body(self) -> None:
         """Bounded-time discard of any unread request body, so the socket can
@@ -155,6 +182,13 @@ class _Handler(BaseHTTPRequestHandler):
         if length > self.max_body_bytes:
             self._reject_body_too_large()
             raise _BodyRejected
+        content_type = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if content_type != "application/json":
+            # text/plain and form encodings are what a browser can send
+            # cross-origin without a CORS preflight.
+            self._drain_request_body()
+            self._send_json(415, {"error": "Content-Type must be application/json"})
+            raise _BodyRejected
         if length == 0:
             return {}
         raw = self.rfile.read(length)
@@ -172,6 +206,11 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if not self._authorized():
             self._reject_unauthorized()
+            return
+        rejected = self._browser_guard()
+        if rejected:
+            self._drain_request_body()
+            self._send_json(rejected[0], {"error": rejected[1]})
             return
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
@@ -196,6 +235,11 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         if not self._authorized():
             self._reject_unauthorized()
+            return
+        rejected = self._browser_guard()
+        if rejected:
+            self._drain_request_body()
+            self._send_json(rejected[0], {"error": rejected[1]})
             return
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
