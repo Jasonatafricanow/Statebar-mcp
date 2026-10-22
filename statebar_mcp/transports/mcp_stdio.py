@@ -79,7 +79,7 @@ class MCPStdioServer:
         try:
             if method == "initialize":
                 result = {
-                    "protocolVersion": params.get("protocolVersion", PROTOCOL_VERSION),
+                    "protocolVersion": PROTOCOL_VERSION,
                     "capabilities": _CAPABILITIES,
                     "serverInfo": SERVER_INFO,
                 }

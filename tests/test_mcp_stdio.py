@@ -81,6 +81,12 @@ def proc(tmp_path):
 
 
 class TestMCPStdioRaw:
+    @pytest.mark.parametrize("requested", ["2024-11-05", "2099-01-01", "unknown", None])
+    def test_initialize_returns_supported_protocol(self, proc, requested):
+        params = {} if requested is None else {"protocolVersion": requested}
+        msg = rpc_call(proc, "initialize", params)
+        assert msg["result"]["protocolVersion"] == "2024-11-05"
+
     def test_ping(self, proc):
         msg = rpc_call(proc, "ping")
         assert msg["result"] == {}
