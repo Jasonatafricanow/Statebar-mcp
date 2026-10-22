@@ -59,7 +59,7 @@ def extract(text, now=None, source_type="conversation"):
 
 
 class TestFastOverlay:
-    @pytest.mark.parametrize("text", ["我刚睡醒", "我刚醒", "睡醒了", "刚起床", "刚醒过来"])
+    @pytest.mark.parametrize("text", ["我刚睡醒", "我刚醒", "睡醒了", "刚起床", "刚醒过来", "I just woke up."])
     def test_awake(self, text):
         obs = extract(text)
         assert any(o.type == "awake" for o in obs), text
@@ -75,6 +75,7 @@ class TestFastOverlay:
         ("我要睡了", "preparing_sleep"),
         ("我去睡了", "preparing_sleep"),
         ("我睡了", "sleeping"),
+        ("I'm going to bed now.", "preparing_sleep"),
     ])
     def test_sleep(self, text, value):
         obs = extract(text)

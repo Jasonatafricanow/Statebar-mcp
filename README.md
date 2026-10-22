@@ -4,13 +4,13 @@
 
 A small MCP and REST service that turns user observations into a current-state snapshot: waking up, changed plans, symptoms and ongoing activities.
 
-**Language support:** the built-in deterministic extraction rules currently recognize Chinese. English text is not covered by an equivalent built-in rule pack. Optional model extraction is a separate, explicitly configured path.
+**Language support:** built-in Chinese rules plus a small English whole-message rule pack for waking, preparing for sleep, headache onset/resolution and taking medication. This is not equivalent coverage of arbitrary English conversation. Optional model extraction is a separate, explicitly configured path.
 
 ## Why reconciliation matters
 
 Discussing sleep does not mean the user is asleep. Assistant messages cannot establish user state; older observations cannot roll back newer state; a new interaction can invalidate a sleeping state.
 
-For example, `我刚睡醒` (“I just woke up”) is a Chinese rule example. The English translation describes its meaning, not an English rule that is currently implemented.
+For example, both `我刚睡醒` and `I just woke up.` trigger an awake observation. English rules require a complete first-person statement; quoted, negated, conditional, historical and third-person examples are not admitted by this rule pack.
 
 ## Run and verify
 
@@ -27,7 +27,7 @@ Source installation is the documented distribution path. See [client configurati
 
 ## Interface and boundaries
 
-Five MCP tools expose observation, snapshots, context candidates, state and health. SQLite stores state locally. If optional LLM extraction is enabled, user text goes to that configured endpoint. MCP initialization advertises the implemented `2024-11-05` protocol rather than echoing arbitrary client versions. English rules and package publication remain follow-ups.
+Five MCP tools expose observation, snapshots, context candidates, state and health. SQLite stores state locally. If optional LLM extraction is enabled, user text goes to that configured endpoint. MCP initialization advertises the implemented `2024-11-05` protocol rather than echoing arbitrary client versions. Broader English coverage and package publication remain follow-ups.
 
 ## License
 
