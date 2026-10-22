@@ -18,6 +18,8 @@ import hashlib
 import re
 from typing import Any, Dict, List, Optional
 
+from .english import AWAKE as ENGLISH_AWAKE, SLEEP as ENGLISH_SLEEP
+
 from ..models import (
     Certainty,
     Observation,
@@ -66,6 +68,7 @@ _VALID_TIME = TimeExpr.ALL
 # mention.  Admission therefore requires lexical evidence in the authoritative
 # user message, not merely a model-proposed ontology key/value.
 _SLEEP_ASSERTION_PATTERNS = [
+    ENGLISH_SLEEP,
     re.compile(
         r"(?:^|[，,。！？!?\s])(?:我)?(?:准备|要|去)睡(?:觉)?了?"
         r"(?=$|[，,。！？!?\s])"
@@ -76,6 +79,7 @@ _SLEEP_ASSERTION_PATTERNS = [
     ),
 ]
 _AWAKE_ASSERTION_PATTERNS = [
+    ENGLISH_AWAKE,
     re.compile(
         r"(?:^|[，,。！？!?\s])(?:我)?(?:刚睡醒|刚醒(?:了|过来)?|睡醒了|刚起床|一觉醒来)"
         r"(?=$|[，,。！？!?\s])"

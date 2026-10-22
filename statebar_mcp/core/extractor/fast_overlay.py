@@ -17,6 +17,8 @@ from __future__ import annotations
 import re
 from typing import List, Optional
 
+from .english import RULES as ENGLISH_RULES
+
 from ..models import (
     Certainty,
     Observation,
@@ -137,6 +139,11 @@ class FastOverlayExtractor:
                     raw_payload=text,
                 )
             )
+
+        for pattern, obs_type, category, key, value, time_expr in ENGLISH_RULES:
+            if pattern.fullmatch(text):
+                add(obs_type, category, key, value, time_expr=time_expr)
+                return found
 
         # 1. awake (must win over the embedded "睡了" in "睡醒了")
         for pat in _AWAKE_PATTERNS:

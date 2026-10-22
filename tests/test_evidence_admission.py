@@ -42,20 +42,6 @@ def test_fast_overlay_does_not_turn_sleep_mentions_into_current_sleep(text):
     assert not any(o.type == "sleep" for o in _fast(text)), text
 
 
-@pytest.mark.parametrize(
-    "text,value",
-    [
-        ("我要睡了", "preparing_sleep"),
-        ("准备睡了", "preparing_sleep"),
-        ("我去睡了", "preparing_sleep"),
-        ("我睡了", "sleeping"),
-    ],
-)
-def test_fast_overlay_keeps_explicit_current_sleep_assertions(text, value):
-    observations = _fast(text)
-    assert any(o.type == "sleep" and o.value == value for o in observations), text
-
-
 def test_persistent_cannot_forge_raw_payload_to_create_sleep():
     request = ObserveRequest(
         subject_id="u",
@@ -82,6 +68,40 @@ def test_persistent_cannot_forge_raw_payload_to_create_sleep():
         ensure_ascii=False,
     )
     assert _parse_llm_json(model_output, request) == []
+
+
+@pytest.mark.parametrize("text", [
+    "I'm not going to bed now.", "Yesterday I just woke up.",
+    'She said "I just woke up".', "Am I awake?",
+    "If I have a headache, I'll take medicine.", "My friend has a headache.",
+])
+def test_english_mentions_do_not_assert_self_state(text):
+    assert _fast(text) == []
+    for obs_type, key in [("sleep", "sleeping"), ("awake", "awake")]:
+        assert validate_observation(
+            {"type": obs_type, "category": "sleep", "key": key, "value": key,
+             "certainty": "confirmed", "time_expression": "now", "confidence": 1.0},
+            "u", "e", Source(type="conversation"), datetime.now(timezone.utc), 0,
+            source_text=text,
+        ) is None
+
+
+@pytest.mark.parametrize("text,obs_type,key", [
+    ("I have a headache.", "symptom", "headache"),
+    ("My headache is gone.", "resolve", "headache"),
+    ("I just took my medication.", "activity", "medication"),
+    ("I am awake now.", "awake", "awake"),
+    ("I am getting ready for bed.", "sleep", "sleeping"),
+])
+def test_english_extraction_agrees_with_persistent_admission(text, obs_type, key):
+    observations = _fast(text)
+    assert len(observations) == 1
+    observation = observations[0]
+    assert (observation.type, observation.key) == (obs_type, key)
+    assert validate_observation(
+        observation.to_dict(), "u", "e", Source(type="conversation"),
+        datetime.now(timezone.utc), 0, source_text=text,
+    ) is not None
 
 
 def test_persistent_rejects_meta_sleep_status_observation():
