@@ -86,11 +86,11 @@ _RIGHT = rf"(?=$|{_BOUND})"
 
 _SLEEP_ASSERTION_PATTERNS = [
     re.compile(
-        rf"{_LEFT}(?:我)?(?:准备|要|去)睡(?:觉)?了?"
+        rf"{_LEFT}(?:我)?(?:准备|要|去)入?睡(?:觉)?了?"  # 入睡 too: 准备入睡了
         rf"{_RIGHT}"
     ),
     re.compile(
-        rf"{_LEFT}(?:我)?(?:已经)?睡(?:觉)?了"
+        rf"{_LEFT}(?:我)?(?:已经)?入?睡(?:觉)?了"
         rf"{_RIGHT}"
     ),
 ]

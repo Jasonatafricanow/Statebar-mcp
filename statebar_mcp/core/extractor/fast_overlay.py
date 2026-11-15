@@ -80,11 +80,11 @@ _SLEEP_PATTERNS = [
     # such as "睡眠记录", "为什么系统显示我睡了", "我没说我睡了",
     # quotations, or historical duration reports.
     re.compile(
-        rf"{_LEFT}(?:我)?(?:准备|要|去)睡(?:觉)?了?"
+        rf"{_LEFT}(?:我)?(?:准备|要|去)入?睡(?:觉)?了?"  # 入睡 too: 准备入睡了
         rf"{_RIGHT}"
     ),
     re.compile(
-        rf"{_LEFT}(?:我)?(?:已经)?睡(?:觉)?了"
+        rf"{_LEFT}(?:我)?(?:已经)?入?睡(?:觉)?了"
         rf"{_RIGHT}"
     ),
 ]

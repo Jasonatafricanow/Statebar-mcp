@@ -178,3 +178,39 @@ def test_fast_overlay_admits_explicit_wake_marks(text):
 )
 def test_fast_overlay_does_not_treat_wake_substrings_as_awake(text):
     assert not any(o.type == "awake" for o in _fast(text)), text
+
+
+# "入睡" wording (2026-11-15): a real self-statement with 入睡 must count,
+# while talk about falling asleep must not.
+import pytest as _pytest  # noqa: E402
+from statebar_mcp.core.extractor.fast_overlay import FastOverlayExtractor as _FOE  # noqa: E402
+from statebar_mcp.core.extractor import validator as _validator  # noqa: E402
+from statebar_mcp.core.models import Source as _Source  # noqa: E402
+from datetime import datetime as _dt, timezone as _tz  # noqa: E402
+
+
+def _sleep_values(text):
+    obs = _FOE().extract("u", "e", text, _Source(type="conversation"), _dt.now(_tz.utc))
+    return [o.value for o in obs if o.category == "sleep"]
+
+
+@_pytest.mark.parametrize("text,value", [
+    ("准备入睡了", "preparing_sleep"),
+    ("我要入睡了", "preparing_sleep"),
+    ("已经入睡了", "sleeping"),
+])
+def test_rusui_self_statement_counts(text, value):
+    assert _sleep_values(text) == [value]
+    raw = {"type": "sleep", "category": "sleep", "key": "sleeping", "value": value,
+           "certainty": "confirmed", "time_expression": "now", "raw_payload": text}
+    assert _validator.validate_observations([raw], "u", "e", _Source(type="conversation"),
+                                            _dt.now(_tz.utc), source_text=text)
+
+
+@_pytest.mark.parametrize("text", ["入睡困难", "入睡时间是几点", "我的入睡记录", "最近入睡太晚"])
+def test_rusui_mentions_do_not_count(text):
+    assert _sleep_values(text) == []
+    raw = {"type": "sleep", "category": "sleep", "key": "sleeping", "value": "sleeping",
+           "certainty": "confirmed", "time_expression": "now", "raw_payload": text}
+    assert not _validator.validate_observations([raw], "u", "e", _Source(type="conversation"),
+                                                _dt.now(_tz.utc), source_text=text)
