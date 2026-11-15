@@ -59,7 +59,11 @@ def extract(text, now=None, source_type="conversation"):
 
 
 class TestFastOverlay:
-    @pytest.mark.parametrize("text", ["我刚睡醒", "我刚醒", "睡醒了", "刚起床", "刚醒过来"])
+    @pytest.mark.parametrize("text", [
+        "我刚睡醒", "我刚醒", "睡醒了", "刚起床", "刚醒过来",
+        "醒了", "我醒了", "刚醒", "已经醒了", "醒过来",
+        "「醒了」", '"醒了"',
+    ])
     def test_awake(self, text):
         obs = extract(text)
         assert any(o.type == "awake" for o in obs), text
@@ -75,6 +79,11 @@ class TestFastOverlay:
         ("我要睡了", "preparing_sleep"),
         ("我去睡了", "preparing_sleep"),
         ("我睡了", "sleeping"),
+        ("睡了", "sleeping"),
+        ("睡觉了", "sleeping"),
+        ("去睡了", "preparing_sleep"),
+        ("「睡了」", "sleeping"),
+        ('"我睡了"', "sleeping"),
     ])
     def test_sleep(self, text, value):
         obs = extract(text)
@@ -102,6 +111,11 @@ class TestFastOverlay:
     def test_no_false_positive_on_plain_chat(self):
         assert extract("今天天气不错") == []
         assert extract("在忙什么呢") == []
+
+    @pytest.mark.parametrize("text", ["醒目", "提醒了", "提醒我", "睡眠记录", "哈哈", "背有点僵"])
+    def test_sleep_wake_no_overmatch(self, text):
+        obs = extract(text)
+        assert not any(o.type in ("awake", "sleep") for o in obs), text
 
 
 # ---------------------------------------------------------------------------

@@ -896,3 +896,45 @@ class TestV2R9EvidencePrecedence:
         rec = Reconciler(SQLiteStore(":memory:"))
         assert not hasattr(rec, "_apply_r9"), "V1 _apply_r9 still present"
         assert not hasattr(reconciler_mod, "_apply_r9")
+
+class TestShortSleepWakeMarks:
+    """UI / casual marks such as 醒了 / 睡了 must update the sleep row, not
+    only the presence/interaction timestamp."""
+
+    @pytest.mark.parametrize("text", ["醒了", "我刚睡醒", "刚醒", "睡醒了", "我醒了", "「醒了」"])
+    def test_wake_marks_flip_sleep_and_record_wake_time(self, text):
+        service, store = make_service()
+        try:
+            t1 = datetime.now(timezone.utc)
+            t2 = t1 + timedelta(minutes=20)
+            observe(service, "u", "e1", "我睡了", t1)
+            assert store.get_state("u", "sleep", "sleeping").status == "active"
+
+            observe(service, "u", "e2", text, t2)
+            sleeping = store.get_state("u", "sleep", "sleeping")
+            awake = store.get_state("u", "sleep", "awake")
+            assert sleeping.status == "superseded", text
+            assert awake is not None and awake.status == "active", text
+            # explicit wake records a real wake time (not merely observed interaction)
+            assert awake.certainty == "confirmed", (text, awake.certainty, awake.value)
+            snap = service.get_snapshot("u")
+            assert "awake since" in snap.text, (text, snap.text)
+            obs = [o for o in store.get_observations("u") if o.event_id == "e2"]
+            assert any(o.type == "awake" and o.category == "sleep" for o in obs), text
+        finally:
+            service.close()
+
+    @pytest.mark.parametrize("text", ["睡了", "我睡了", "去睡了", "睡觉了"])
+    def test_sleep_marks_not_woken_by_same_turn_presence(self, text):
+        service, store = make_service()
+        try:
+            t = datetime.now(timezone.utc)
+            observe(service, "u", "e1", text, t)
+            sleeping = store.get_state("u", "sleep", "sleeping")
+            assert sleeping is not None and sleeping.status == "active", text
+            obs = [o for o in store.get_observations("u") if o.event_id == "e1"]
+            assert any(o.type == "sleep" and o.category == "sleep" for o in obs), text
+            # presence may also be recorded on the same event, but must not win
+            assert any(o.key == "interactive_activity" for o in obs)
+        finally:
+            service.close()

@@ -65,24 +65,47 @@ _VALID_TIME = TimeExpr.ALL
 # Current sleep/wake state is high-impact and easy to corrupt through keyword
 # mention.  Admission therefore requires lexical evidence in the authoritative
 # user message, not merely a model-proposed ontology key/value.
+def _boundary_class(chars: str) -> str:
+    """Build a safe character class from a literal set of boundary glyphs."""
+    out = []
+    for ch in chars:
+        if ch in r"\]^-":
+            out.append("\\" + ch)
+        else:
+            out.append(ch)
+    return "[" + "".join(out) + "]"
+
+
+# Quotes and colons included so UI marks like 「醒了」 / "睡了" still count,
+# while embedded words like 提醒了 / 醒目 / 睡眠记录 do not.
+_BOUND = _boundary_class(
+    "，,。！？!?、；;：: \t\n\r" + '"' + "“”「」『』（）()【】[]"
+)
+_LEFT = rf"(?:^|{_BOUND})"
+_RIGHT = rf"(?=$|{_BOUND})"
+
 _SLEEP_ASSERTION_PATTERNS = [
     re.compile(
-        r"(?:^|[，,。！？!?\s])(?:我)?(?:准备|要|去)睡(?:觉)?了?"
-        r"(?=$|[，,。！？!?\s])"
+        rf"{_LEFT}(?:我)?(?:准备|要|去)睡(?:觉)?了?"
+        rf"{_RIGHT}"
     ),
     re.compile(
-        r"(?:^|[，,。！？!?\s])(?:我)?(?:已经)?睡(?:觉)?了"
-        r"(?=$|[，,。！？!?\s])"
+        rf"{_LEFT}(?:我)?(?:已经)?睡(?:觉)?了"
+        rf"{_RIGHT}"
     ),
 ]
 _AWAKE_ASSERTION_PATTERNS = [
     re.compile(
-        r"(?:^|[，,。！？!?\s])(?:我)?(?:刚睡醒|刚醒(?:了|过来)?|睡醒了|刚起床|一觉醒来)"
-        r"(?=$|[，,。！？!?\s])"
+        rf"{_LEFT}(?:我)?(?:刚睡醒|刚醒(?:了|过来)?|睡醒了|刚起床|一觉醒来)"
+        rf"{_RIGHT}"
     ),
     re.compile(
-        r"(?:^|[，,。！？!?\s])(?:我)?(?:现在)?醒着"
-        r"(?=$|[，,。！？!?\s])"
+        rf"{_LEFT}(?:我)?(?:已经|都)?(?:醒了|醒过来)"
+        rf"{_RIGHT}"
+    ),
+    re.compile(
+        rf"{_LEFT}(?:我)?(?:现在)?醒着"
+        rf"{_RIGHT}"
     ),
 ]
 

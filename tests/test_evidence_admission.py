@@ -49,6 +49,9 @@ def test_fast_overlay_does_not_turn_sleep_mentions_into_current_sleep(text):
         ("准备睡了", "preparing_sleep"),
         ("我去睡了", "preparing_sleep"),
         ("我睡了", "sleeping"),
+        ("睡了", "sleeping"),
+        ("睡觉了", "sleeping"),
+        ("「睡了」", "sleeping"),
     ],
 )
 def test_fast_overlay_keeps_explicit_current_sleep_assertions(text, value):
@@ -159,3 +162,19 @@ def test_invalid_certainty_is_rejected_instead_of_promoted_to_confirmed():
         source_text="今天看书了",
     )
     assert obs is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["醒了", "我醒了", "我刚睡醒", "刚醒", "睡醒了", "「醒了」"],
+)
+def test_fast_overlay_admits_explicit_wake_marks(text):
+    assert any(o.type == "awake" for o in _fast(text)), text
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["醒目", "提醒了", "提醒我"],
+)
+def test_fast_overlay_does_not_treat_wake_substrings_as_awake(text):
+    assert not any(o.type == "awake" for o in _fast(text)), text

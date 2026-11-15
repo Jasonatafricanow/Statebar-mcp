@@ -44,8 +44,34 @@ SYMPTOM_LEXICON = [
 
 _BODY_ALT = "|".join(p for p, _, _ in SYMPTOM_LEXICON)
 
+def _boundary_class(chars: str) -> str:
+    """Build a safe character class from a literal set of boundary glyphs."""
+    out = []
+    for ch in chars:
+        if ch in r"\]^-":
+            out.append("\\" + ch)
+        else:
+            out.append(ch)
+    return "[" + "".join(out) + "]"
+
+
+# Quotes and colons included so UI marks like 「醒了」 / "睡了" still count,
+# while embedded words like 提醒了 / 醒目 / 睡眠记录 do not.
+_BOUND = _boundary_class(
+    "，,。！？!?、；;：: \t\n\r" + '"' + "“”「」『』（）()【】[]"
+)
+_LEFT = rf"(?:^|{_BOUND})"
+_RIGHT = rf"(?=$|{_BOUND})"
+
 _AWAKE_PATTERNS = [
+    # Longer / existing phrases (may appear mid-sentence without a leading punct).
     re.compile(r"刚睡醒|刚醒(?:了|过来)?|睡醒了|刚起床|一觉醒来|睡了个好觉刚醒"),
+    # Short marks used in the statebar UI and casual chat: 醒了 / 我醒了.
+    # _SLEEP_WAKE_WORDS used to list 醒了 but was never applied, so a lone
+    # 「醒了」 produced no sleep observation and only presence/interaction.
+    re.compile(
+        rf"{_LEFT}(?:我)?(?:已经|都)?(?:醒了|醒过来){_RIGHT}"
+    ),
 ]
 
 _SLEEP_PATTERNS = [
@@ -54,12 +80,12 @@ _SLEEP_PATTERNS = [
     # such as "睡眠记录", "为什么系统显示我睡了", "我没说我睡了",
     # quotations, or historical duration reports.
     re.compile(
-        r"(?:^|[，,。！？!?\s])(?:我)?(?:准备|要|去)睡(?:觉)?了?"
-        r"(?=$|[，,。！？!?\s])"
+        rf"{_LEFT}(?:我)?(?:准备|要|去)睡(?:觉)?了?"
+        rf"{_RIGHT}"
     ),
     re.compile(
-        r"(?:^|[，,。！？!?\s])(?:我)?(?:已经)?睡(?:觉)?了"
-        r"(?=$|[，,。！？!?\s])"
+        rf"{_LEFT}(?:我)?(?:已经)?睡(?:觉)?了"
+        rf"{_RIGHT}"
     ),
 ]
 
@@ -79,8 +105,6 @@ _SYMPTOM_ACTIVE = re.compile(
 _MEDICATION = re.compile(r"吃(?:了点?|过|完)?药(?:了)?|刚(?:才)?吃药|服药了|刚吃完药")
 
 _CONFIRM_PLAN = re.compile(r"确认|说好了|就这么定|一定去|肯定去")
-
-_SLEEP_WAKE_WORDS = re.compile(r"睡醒|醒了|起床")
 
 
 def _mask(text: str, span: tuple[int, int]) -> str:
