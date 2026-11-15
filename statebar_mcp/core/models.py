@@ -329,6 +329,10 @@ class ObserveRequest:
     text: str
     source: Source = field(default_factory=Source)
     observed_at: datetime = field(default_factory=utc_now)
+    # Host-extracted observations (same JSON shape as the persistent LLM extractor's output).
+    # When present, the host's own model did the extraction as part of its normal inference;
+    # statebar still validates them against `text` and reconciles them. None = classic observe.
+    observations: Optional[List[Dict[str, Any]]] = None
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ObserveRequest":
@@ -338,6 +342,7 @@ class ObserveRequest:
             text=str(data.get("text", "")),
             source=Source.from_dict(data.get("source")),
             observed_at=parse_dt(data.get("observed_at") or utc_now().isoformat()),
+            observations=data.get("observations"),
         )
 
 

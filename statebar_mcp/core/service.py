@@ -33,6 +33,7 @@ from typing import Dict, List, Optional
 
 from .extractor.fast_overlay import FastOverlayExtractor
 from .extractor.persistent import PersistentExtractor
+from .extractor import validator
 from .lifecycle import lazy_expire
 from .models import (
     Certainty,
@@ -89,6 +90,8 @@ class UserStateService:
 
     def observe(self, request: ObserveRequest) -> Dict:
         """Application-layer observe. Returns a JSON-safe result dict."""
+        if request.observations is not None:
+            return self._observe_host(request)
         subject_id, event_id = request.subject_id, request.event_id
 
         existing = self.store.get_event(subject_id, event_id)
@@ -156,6 +159,58 @@ class UserStateService:
             # nothing more will ever happen for this event
             self.store.set_event_status(subject_id, event_id, "complete")
         return result
+
+    def _observe_host(self, request: ObserveRequest) -> Dict:
+        """Host-extracted observations: the host agent's own model already read the
+        user's message as part of its normal turn and proposes Observation JSON
+        (same contract as the persistent extractor). Nothing is trusted as-is:
+        every item goes through the deterministic validator against ``text`` (the
+        user's original words — semantic admission for sleep/wake included), then
+        the Reconciler, exactly like the async persistent path.
+
+        Recorded as its own event ``<event_id>#host`` (idempotent; the user's
+        message event keeps its fast-rule/interaction observations). Like a late
+        re-analysis it runs at the message's ORIGINAL semantic time with strict
+        replay rules, so it can never revive or downgrade a state that a
+        same-or-later observation owns. No interaction evidence is added: this is
+        an analysis of an earlier message, not a new user interaction.
+        """
+        subject_id = request.subject_id
+        host_event = f"{request.event_id}#host"
+        existing = self.store.get_event(subject_id, host_event)
+        if existing and existing["status"] == "complete":
+            return {"status": "duplicate", "subject_id": subject_id, "event_id": host_event}
+        if existing is None:
+            self.store.try_ingest_event(subject_id, host_event, request.observed_at)
+        payload = request.observations if isinstance(request.observations, list) else []
+        observations = validator.validate_observations(
+            payload,
+            subject_id,
+            host_event,
+            request.source,
+            request.observed_at,
+            start_index=0,
+            source_text=request.text,
+        )
+        leftovers = self.store.get_unreconciled_observations(subject_id, host_event)
+        replay_keys = {(o.event_id, o.observation_index) for o in leftovers}
+        with self.store.transaction():
+            self.store.insert_observations(observations)
+            unreconciled = self.store.get_unreconciled_observations(subject_id, host_event)
+            for o in unreconciled:
+                o.is_replay = True
+            applied = self._reconcile_all(subject_id, unreconciled, replay_keys)
+            self.store.mark_observations_reconciled(subject_id, host_event, unreconciled)
+            self.store.set_event_status(subject_id, host_event, "complete")
+        return {
+            "status": "accepted" if existing is None else "resumed",
+            "subject_id": subject_id,
+            "event_id": host_event,
+            "host_observations": [o.to_dict() for o in observations],
+            "host_rejected": len(payload) - len(observations),
+            "sync_states_changed": [s.to_dict() for s in applied],
+            "async_scheduled": False,
+        }
 
     # -- worker (single thread, bounded lifecycle) -----------------------------
 

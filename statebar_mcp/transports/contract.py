@@ -34,6 +34,16 @@ TOOLS: List[Dict[str, Any]] = [
                     "type": "string",
                     "description": "ISO8601 semantic time (caller-supplied), not server receipt time",
                 },
+                "observations": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": (
+                        "Optional host-extracted observations (persistent-extractor JSON shape: "
+                        "type, category, key, value, certainty, time_expression, confidence, raw_payload). "
+                        "Validated against text and reconciled as event '<event_id>#host'; "
+                        "lets the host's own model replace the built-in LLM extractor."
+                    ),
+                },
                 "source": {
                     "type": "object",
                     "description": "Provenance: type (conversation|diary|health|assistant_question), platform, session_id, message_id",
@@ -112,6 +122,12 @@ class Contract:
     # -- typed handlers --------------------------------------------------------
 
     def observe(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        observations = args.get("observations")
+        if observations is not None:
+            if not isinstance(observations, list) or len(observations) > 20:
+                raise ContractError("observations must be a list of at most 20 items")
+            if not str(args.get("text") or "").strip():
+                raise ContractError("observations require text (the user's original words)")
         request = ObserveRequest.from_dict(args)
         return self.service.observe(request)
 
