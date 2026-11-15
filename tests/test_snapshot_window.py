@@ -90,6 +90,19 @@ def test_snapshot_states_the_users_day():
         w.close()
 
 
+def test_changed_states_carry_the_users_day():
+    w = World()
+    try:
+        w.say(at(15, 22))
+        w.now = at(16, 1, 30)
+        result = w.service.observe(ObserveRequest(subject_id="u", event_id="sleep", text="我要睡了",
+                                                  source=Source(type="conversation"), observed_at=at(16, 1, 30)))
+        sleep = next(s for s in result["sync_states_changed"] if s["key"] == "sleeping")
+        assert sleep["user_day"] == "2026-11-15"  # the night of the 15th, though the calendar says 16th
+    finally:
+        w.close()
+
+
 def test_tonight_said_past_midnight_is_the_ongoing_night():
     w = World()
     try:

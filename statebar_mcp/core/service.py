@@ -140,7 +140,7 @@ class UserStateService:
             "subject_id": subject_id,
             "event_id": event_id,
             "sync_observations": [o.to_dict() for o in sync_obs],
-            "sync_states_changed": [s.to_dict() for s in sync_applied],
+            "sync_states_changed": [self._state_out(s) for s in sync_applied],
             "async_scheduled": False,
         }
         if status in ("pending", "failed"):
@@ -159,6 +159,17 @@ class UserStateService:
             # nothing more will ever happen for this event
             self.store.set_event_status(subject_id, event_id, "complete")
         return result
+
+    def _state_out(self, state) -> Dict:
+        """State dict for observe results, plus the user's day its start belongs to
+        (it changes when they sleep, not at midnight), so downstream consumers
+        can date it the way the user would."""
+        out = state.to_dict()
+        try:
+            out["user_day"] = self.reconciler.subjective_date(state.subject_id, state.valid_from).isoformat()
+        except Exception:  # never let a label break observe
+            logger.debug("user_day unavailable for state %s", state.state_id)
+        return out
 
     def _observe_host(self, request: ObserveRequest) -> Dict:
         """Host-extracted observations: the host agent's own model already read the
@@ -208,7 +219,7 @@ class UserStateService:
             "event_id": host_event,
             "host_observations": [o.to_dict() for o in observations],
             "host_rejected": len(payload) - len(observations),
-            "sync_states_changed": [s.to_dict() for s in applied],
+            "sync_states_changed": [self._state_out(s) for s in applied],
             "async_scheduled": False,
         }
 
