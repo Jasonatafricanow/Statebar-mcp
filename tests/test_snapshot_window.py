@@ -74,6 +74,22 @@ def test_tomorrow_said_past_midnight_before_sleeping_means_after_the_sleep():
         w.close()
 
 
+def test_snapshot_states_the_users_day():
+    w = World()
+    try:
+        w.say(at(15, 22))
+        w.say(at(16, 1, 20))
+        snap = w.service.get_snapshot("u")
+        assert (snap.user_day, snap.calendar_day) == ("2026-11-15", "2026-11-16")
+        assert "user's day: 2026-11-15 (calendar already 2026-11-16" in snap.text
+        w.say(at(16, 10))  # after a night's rest
+        snap = w.service.get_snapshot("u")
+        assert snap.user_day == snap.calendar_day == "2026-11-16"
+        assert "calendar already" not in snap.text
+    finally:
+        w.close()
+
+
 def test_tonight_said_past_midnight_is_the_ongoing_night():
     w = World()
     try:

@@ -157,7 +157,11 @@ class SnapshotBuilder:
                 query_items.append(self._render(state, today, subjective))
 
         items = base_items + query_items
-        lines = ["CURRENT USER STATE"]
+        calendar = now.astimezone().date()
+        day_line = f"- user's day: {today.isoformat()}"
+        if today != calendar:
+            day_line += f" (calendar already {calendar.isoformat()}; not slept yet, still the same day for the user)"
+        lines = ["CURRENT USER STATE", day_line]
         if not items:
             lines.append("(no current states)")
         for item in items[:MAX_LINES]:
@@ -169,6 +173,8 @@ class SnapshotBuilder:
             items=items,
             base_items=base_items,
             query_items=query_items,
+            user_day=today.isoformat(),
+            calendar_day=calendar.isoformat(),
         )
 
     # -- rendering ------------------------------------------------------------

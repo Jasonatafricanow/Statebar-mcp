@@ -427,11 +427,16 @@ class Snapshot:
     items: List[SnapshotItem] = field(default_factory=list)
     base_items: List[SnapshotItem] = field(default_factory=list)
     query_items: List[SnapshotItem] = field(default_factory=list)
+    # The user's current day (changes when they sleep, not at midnight) and the calendar date.
+    user_day: Optional[str] = None
+    calendar_day: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "subject_id": self.subject_id,
             "text": self.text,
+            "user_day": self.user_day,
+            "calendar_day": self.calendar_day,
             "items": [
                 {
                     "text": i.text,
