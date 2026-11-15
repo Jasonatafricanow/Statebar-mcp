@@ -8,10 +8,10 @@ Lazy expiration (R10) runs first, so expired plans are excluded on read.
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List
 
-from .lifecycle import lazy_expire
+from .lifecycle import SUBJECTIVE_LOOKBACK_HOURS, lazy_expire, subjective_date
 from .models import Snapshot, SnapshotItem, State, StateStatus
 from .store import SQLiteStore
 
@@ -70,20 +70,31 @@ def _hhmm(dt: datetime) -> str:
     return f"{local.hour:02d}:{local.minute:02d}"
 
 
-def _window_note(state: State) -> str:
-    """Human note for the semantic window of a plan."""
+def _window_note(state: State, today) -> str:
+    """Human note for the semantic window of a plan, relative to the user's TODAY.
+
+    ``today`` is the subjective date (it changes when the user sleeps, not at
+    midnight). The window is anchored on the day the plan was mentioned, so the
+    label must be computed against the current day: a plan for "tomorrow" ends
+    at 23:59 of the next day and used to render as "tonight"; once that day
+    arrives it is "today". "today" and "tonight" share the same window (until
+    23:59), so a same-day end-of-day window renders as "today", true for both.
+    """
     if state.valid_until is None:
         return ""
     local = state.valid_until.astimezone()
-    if local.hour == 17 and local.minute == 0:
-        return "afternoon"
-    if local.hour == 12 and local.minute == 0:
-        return "morning"
-    if local.hour == 19 and local.minute == 0:
-        return "evening"
+    days_ahead = (local.date() - today).days
+    if days_ahead < 0:
+        return ""
+    part = {(17, 0): "afternoon", (12, 0): "morning", (19, 0): "evening"}.get((local.hour, local.minute), "")
     if local.hour == 23:
-        return "tonight"
-    return ""
+        part = "today"
+    if not part:
+        return ""  # a plain TTL window (e.g. "tonight" said past midnight) carries no day label
+    if days_ahead == 0:
+        return part
+    day = "tomorrow" if days_ahead == 1 else local.strftime("%m-%d")
+    return day if part == "today" else f"{day} {part}"
 
 
 class SnapshotBuilder:
@@ -101,6 +112,14 @@ class SnapshotBuilder:
             self.store.record_transition(tr)
         for st in mutated:
             self.store.insert_state(st)
+
+        # The user's day changes when they sleep, not at midnight.
+        activity = self.store.get_activity_times(subject_id, now - timedelta(hours=2 * SUBJECTIVE_LOOKBACK_HOURS))
+
+        def subjective(at: datetime):
+            return subjective_date(at, activity, states)
+
+        today = subjective(now)
 
         candidates: List[State] = [
             s
@@ -123,7 +142,7 @@ class SnapshotBuilder:
         ranked = sorted(candidates, key=rank, reverse=True)
         base = ranked[:BASE_CAP]
         base_ids = {id(s) for s in base}
-        base_items = [self._render(s, now) for s in base]
+        base_items = [self._render(s, today, subjective) for s in base]
 
         query_items: List[SnapshotItem] = []
         if query:
@@ -135,7 +154,7 @@ class SnapshotBuilder:
             for score, state in sorted(scored, key=lambda p: -p[0]):
                 if score <= 0 or len(query_items) >= QUERY_CAP:
                     break
-                query_items.append(self._render(state, now))
+                query_items.append(self._render(state, today, subjective))
 
         items = base_items + query_items
         lines = ["CURRENT USER STATE"]
@@ -154,7 +173,7 @@ class SnapshotBuilder:
 
     # -- rendering ------------------------------------------------------------
 
-    def _render(self, state: State, now: datetime) -> SnapshotItem:
+    def _render(self, state: State, today, subjective) -> SnapshotItem:
         key, category, status = state.key, state.category, state.status
 
         if category == "sleep" and key == "awake":
@@ -170,12 +189,12 @@ class SnapshotBuilder:
             text = "medication taken recently"
         elif category == "planning":
             label = _KEY_LABELS.get(key, key)
-            window = _window_note(state)
+            window = _window_note(state, today)
             prefix = f"{window} " if window else ""
             text = f"{prefix}{label} plan: {status}"
         elif category == "activity":
             label = _KEY_LABELS.get(key, key)
-            when = "today" if state.valid_from.astimezone().date() == now.astimezone().date() else "recently"
+            when = "today" if subjective(state.valid_from) == today else "recently"
             text = f"{label} {when}" if status == StateStatus.COMPLETED else f"{label}: {status}"
         elif category == "health":
             label = _KEY_LABELS.get(key, key)

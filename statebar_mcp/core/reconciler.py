@@ -50,7 +50,13 @@ class Reconciler:
     def __init__(self, store: SQLiteStore, now_fn=utc_now, inference=None):
         self.store = store
         self._now_fn = now_fn
-        self.inference = inference or TransitionPlanner(now_fn=now_fn)
+        self.inference = inference or TransitionPlanner(now_fn=now_fn, day_fn=self.subjective_date)
+
+    def subjective_date(self, subject_id: str, at: datetime):
+        """The user's current day at ``at``: changes when they sleep, not at midnight."""
+        since = at - timedelta(hours=lifecycle.SUBJECTIVE_LOOKBACK_HOURS)
+        return lifecycle.subjective_date(
+            at, self.store.get_activity_times(subject_id, since), self.store.get_states(subject_id))
 
     def _now(self) -> datetime:
         return self._now_fn()

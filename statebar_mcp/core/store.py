@@ -407,6 +407,17 @@ class SQLiteStore:
             raw_payload=row["raw_payload"],
         )
 
+    def get_activity_times(self, subject_id: str, since: datetime) -> List[datetime]:
+        """Semantic times of the subject's observations since ``since`` (any
+        source except assistant questions), used to find rest gaps."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT observed_at FROM observations WHERE subject_id=? AND observed_at >= ? "
+                "AND source_type != 'assistant_question' ORDER BY observed_at",
+                (subject_id, _iso(since)),
+            ).fetchall()
+        return [parse_dt(r["observed_at"]) for r in rows]
+
     # -- states --------------------------------------------------------------
 
     def get_states(self, subject_id: str) -> List[State]:

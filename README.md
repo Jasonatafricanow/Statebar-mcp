@@ -53,6 +53,8 @@ The current implementation tracks:
 
 Older observations do not roll newer state backward.
 
+The user's day changes when they sleep, not at midnight. Still up at 1 a.m., it is the same day for them: "tomorrow" means the day after the coming sleep, and "today"/"tonight" mean the night that is still going on. The current day is the date on which the most recent rest ended. Rest is an explicit sleep→wake record, or, without one, a silence of at least 4 hours that ends in the morning (a 00:30 return after an evening out is not a new day). Plan windows and snapshot labels ("today", "tomorrow", "tomorrow afternoon") use this day.
+
 Assistant-authored text is not accepted as evidence that the user entered a state.
 
 ## Evidence from interaction

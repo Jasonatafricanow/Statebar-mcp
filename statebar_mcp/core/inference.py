@@ -57,11 +57,16 @@ class TransitionPlanner:
     """Produces TransitionIntents from observations. Stateless and
     side-effect free (pure function over its inputs + injected clock)."""
 
-    def __init__(self, now_fn=utc_now):
+    def __init__(self, now_fn=utc_now, day_fn=None):
         self._now_fn = now_fn
+        # day_fn(subject_id, at) -> the user's subjective date (sleep-based), or None.
+        self._day_fn = day_fn
 
     def _now(self):
         return self._now_fn()
+
+    def _day_anchor(self, obs: Observation):
+        return self._day_fn(obs.subject_id, obs.observed_at) if self._day_fn else None
 
     def infer(
         self, obs: Observation, states: List[State]
@@ -282,7 +287,8 @@ class TransitionPlanner:
 
         if existing is not None and existing.status in _PLAN_STATUSES:
             _, new_until, new_relevant = lifecycle.semantic_window(
-                obs.time_expression, obs.observed_at, self._now()
+                obs.time_expression, obs.observed_at, self._now(),
+                day_anchor=self._day_anchor(obs),
             )
             if new_until != existing.valid_until:
                 # R6 reschedule: a new window supersedes the old episode.
@@ -331,7 +337,8 @@ class TransitionPlanner:
             # guard lives in the Reconciler (_is_stale_creation consults the
             # store across ALL statuses).
             _, valid_until, relevant_until = lifecycle.semantic_window(
-                obs.time_expression, obs.observed_at, self._now()
+                obs.time_expression, obs.observed_at, self._now(),
+                day_anchor=self._day_anchor(obs),
             )
             intents.append(
                 self._plan_establish(
