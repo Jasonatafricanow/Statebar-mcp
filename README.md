@@ -63,6 +63,43 @@ For example, a current user-authored interaction can invalidate an older `sleepi
 
 The rule is implemented in normal Python state-transition logic, not by asking an LLM to decide final state.
 
+## Host-extracted observations
+
+### Why
+
+In agent deployments Statebar is not used on its own: it sits behind a host agent that already reads every user message. Two problems showed up in practice.
+
+1. **The agent skipped the state layer.** The host rarely called state tools by itself. Instead it wrote "facts" about the user straight into its long-term memory from conversation text, and when it reconstructed details later it moved events to the wrong day or turned guesses into precise numbers (a stated "around 4 a.m." became "fell asleep at 4:20"). The validation that would have caught this was bypassed, not broken. A wrong memory is worse than a missing one, because later reasoning builds on it.
+2. **The obvious fix costs a second inference.** Enabling Statebar's own LLM extractor means interpreting the same message twice: once by the host to reply, and again by a dedicated extraction call. That is extra cost and latency for understanding the host already has, so in that deployment the extractor stayed off and only fast rules ran. Plans, symptoms and activities were never captured.
+
+### What changed
+
+`observe` accepts an optional `observations` array in the persistent extractor's JSON shape. The host proposes observations as a by-product of the turn it is already running. Statebar keeps the authority:
+
+- every item still passes the deterministic validator against `text` (the user's original words), including sleep/wake semantic admission. A mention, a question or a reconstruction is rejected just as it would be from the built-in extractor;
+- the observations are stored as their own idempotent event `<event_id>#host` and reconciled at the message's original semantic time with the strict replay rules used for late analyses, so they cannot revive or downgrade newer state;
+- they add no interaction evidence;
+- without the field, `observe` behaves exactly as before.
+
+```json
+{"subject_id": "user-001", "event_id": "tg:msg-123", "text": "下午可能去写书法", "observed_at": "…",
+ "observations": [{"type": "plan", "category": "planning", "key": "calligraphy", "value": "go practice calligraphy",
+                   "certainty": "tentative", "time_expression": "afternoon", "confidence": 0.9,
+                   "raw_payload": "下午可能去写书法"}]}
+```
+
+Intended host flow:
+
+```text
+observe(event_id, user text)              before the reply: fast rules + interaction evidence
+host replies, emits observation JSON       same inference, no extra model call
+observe(event_id, user text, observations) after the reply: validated + reconciled as <event_id>#host
+accepted state changes -> downstream       memory / logs receive authenticated state,
+                                           not the agent's own recollection
+```
+
+This makes Statebar the gate in front of downstream tools: a current-state fact reaches them only after it has passed evidence rules.
+
 ## Main modules
 
 ```text
@@ -87,7 +124,7 @@ Some module names predate the current simplification work; for example `ontology
 
 Core operations include:
 
-- `observe` — ingest user text or interaction evidence;
+- `observe` — ingest user text or interaction evidence, optionally with host-extracted observations;
 - `snapshot` — return bounded current state;
 - `context_candidates` — return recent/relevant items;
 - `get_state` — inspect stored state.
@@ -122,7 +159,7 @@ Example MCP configuration:
 
 The default store is local SQLite.
 
-Optional LLM extraction is disabled unless configured. If enabled, raw user text is sent to the configured endpoint.
+Optional LLM extraction is disabled unless configured. If enabled, raw user text is sent to the configured endpoint. Host-extracted observations need no extra endpoint: they come from the model the host already uses.
 
 REST defaults to loopback. Non-loopback binding requires an authentication token.
 
@@ -164,6 +201,7 @@ Regression coverage includes:
 - explicit sleep/wake statements;
 - interaction-derived wakefulness;
 - replay/idempotency;
+- host-extracted observations (admission against the user's words, idempotency, late-analysis ordering);
 - MCP and REST behavior.
 
 ## Development history
