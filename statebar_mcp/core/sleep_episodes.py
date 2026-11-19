@@ -205,8 +205,11 @@ def _opt_dt(value: Any) -> Optional[datetime]:
 
 def validate_episode(raw: Dict[str, Any], *, subject_id: str, event_id: str, index: int,
                      text: str, observed_at: datetime, message_id: str = "",
-                     activity_times: Optional[List[datetime]] = None) -> Tuple[Optional[SleepEpisode], str]:
-    """Return (episode, "") or (None, reason). ``text`` is the user's own message."""
+                     activity_times: Optional[List[datetime]] = None,
+                     infer: bool = True) -> Tuple[Optional[SleepEpisode], str]:
+    """Return (episode, "") or (None, reason). ``text`` is the user's own message.
+    ``infer=False`` (someone else's sleep): only what the user stated; the user's own chat
+    silence or "醒了" says nothing about another person."""
     if not isinstance(raw, dict):
         return None, "not an object"
     if not text or not _SLEEP_WORD_RE.search(text):
@@ -248,13 +251,15 @@ def validate_episode(raw: Dict[str, Any], *, subject_id: str, event_id: str, ind
         # with both ends known a mismatching duration is simply dropped
 
     # "我刚醒" with no time: the wake is (about) now.
-    if ep.end_at is None and ep.duration_min is None and re.search(r"醒|起床|起来", text):
+    # Not when the user named a clock the item left out ("十二点不到醒了" said at 03:19 is not a wake at 03:19).
+    if infer and ep.end_at is None and ep.duration_min is None and re.search(r"醒|起床|起来", text) \
+            and not clock_mentions(text):
         ep.end_at, ep.end_basis = observed_at, INFERRED
     if ep.end_at is None and ep.start_at is None and ep.duration_min is None:
         return None, "no sleep time, wake time or duration"
 
     # A missing start may come from the silence before the wake (marked inferred).
-    if ep.start_at is None and ep.duration_min is None and ep.end_at is not None and activity_times:
+    if infer and ep.start_at is None and ep.duration_min is None and ep.end_at is not None and activity_times:
         before = [t for t in activity_times if t < ep.end_at - timedelta(minutes=1)]
         if before:
             last = max(before)

@@ -166,3 +166,63 @@ def test_history_import_keeps_local_clock_and_only_sends_complete_days(svc):
     assert {p["sleepHours"] for p in posted} == {5.33, 6.0}
     again = service.import_sleep_history(SUBJECT, "t1", items)
     assert again["inserted"] == 0 and len(posted) == 2
+
+
+# -- family members (P1B-2b) ---------------------------------------------------------
+
+FAMILY = {"members": [{"subject_id": "kid", "name": "娃", "aliases": ["娃", "闺女"]},
+                      {"subject_id": "gao", "name": "高老师", "aliases": ["高老师"]}]}
+
+
+@pytest.fixture
+def family_svc():
+    from statebar_mcp.core.family import parse_members
+    posted = []
+    sync = HealthSync(url="http://health.test/api/health-webhook", token="t", subject_id=SUBJECT,
+                      post=lambda url, token, body: posted.append(body) or {"ok": True})
+    service = UserStateService(SQLiteStore(":memory:"), persistent_extractor=PersistentExtractor(), health_sync=sync,
+                               family_members=parse_members(FAMILY))
+    yield service, posted, sync
+    service.close()
+
+
+def test_a_named_members_stated_sleep_goes_to_that_member_not_the_user(family_svc):
+    service, posted, _ = family_svc
+    r = say(service, "m1", "娃昨晚九点睡的，早上六点半醒，我自己一点才睡", at("2026-11-19T09:00"),
+            [ep("2026-11-18T21:00", "2026-11-19T06:30", who="娃")])
+    assert r["sleep_rejected"] == [] and r["sleep_episodes"][0]["subject_id"] == "kid"
+    assert service.get_sleep(SUBJECT)["episodes"] == []
+    assert len(service.get_sleep("kid")["episodes"]) == 1
+    assert posted == []  # household mode is off: a member's sleep stays in statebar
+
+
+def test_unknown_or_unmentioned_people_and_unstated_member_times_are_not_written(family_svc):
+    service, _, _ = family_svc
+    r = say(service, "m1", "老婆我醒了，娃也醒了", at("2026-11-19T07:00"),
+            [ep(None, None, who="老婆"), ep(None, None, who="娃"), ep("2026-11-19T01:00", "2026-11-19T06:00", who="高老师")])
+    assert r["sleep_episodes"] == [] and len(r["sleep_rejected"]) == 3
+    assert "unknown family member" in r["sleep_rejected"][0]   # 老婆 is Xiyue, not a household member
+    assert "no sleep time" in r["sleep_rejected"][1]           # the user's "醒了" says nothing about when 娃 woke
+    assert "not mentioned" in r["sleep_rejected"][2]
+
+
+def test_kid_waking_at_night_is_the_users_own_broken_sleep(family_svc):
+    service, _, _ = family_svc
+    r = say(service, "m1", "娃后半夜闹腾，我两点醒了，三点才又睡着，七点起的", at("2026-11-19T07:20"),
+            [ep("2026-11-19T03:00", "2026-11-19T07:00")])
+    assert [e["subject_id"] for e in r["sleep_episodes"]] == [SUBJECT]
+
+
+def test_a_mapped_member_is_sent_with_its_household_member_id(family_svc):
+    service, posted, sync = family_svc
+    sync.members = {"kid": "kid"}
+    say(service, "m1", "娃昨晚九点睡的，早上六点半醒", at("2026-11-19T09:00"),
+        [ep("2026-11-18T21:00", "2026-11-19T06:30", who="娃")])
+    assert [(p["memberId"], p["sleepHours"]) for p in posted] == [("kid", 9.5)]
+
+
+def test_a_bare_wake_is_not_now_when_the_user_named_a_clock(svc):
+    service, posted = svc
+    # probe 11-19: the model dropped the times of "十二点不到醒了" said at 03:19
+    r = say(service, "m1", "后续的话十点不到就睡了，但是十二点不到醒了。", at("2026-11-18T03:19"), [{"type": "sleep_episode"}])
+    assert r["sleep_episodes"] == [] and posted == []

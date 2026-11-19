@@ -37,6 +37,7 @@ from .extractor.persistent import PersistentExtractor
 from .extractor import validator
 from . import sleep_episodes
 from .health_sync import HealthSync
+from . import family
 from .lifecycle import lazy_expire
 from .models import (
     Certainty,
@@ -72,9 +73,11 @@ class UserStateService:
         persistent_extractor: Optional[PersistentExtractor] = None,
         now_fn=utc_now,
         health_sync: Optional[HealthSync] = None,
+        family_members: Optional[list] = None,
     ):
         self.store = store
         self.health_sync = health_sync or HealthSync.from_env()
+        self.family = family.load_members() if family_members is None else family_members
         self.fast_extractor = fast_extractor or FastOverlayExtractor()
         self.persistent_extractor = persistent_extractor or PersistentExtractor()
         self._now_fn = now_fn
@@ -222,7 +225,7 @@ class UserStateService:
             self.store.mark_observations_reconciled(subject_id, host_event, unreconciled)
             sleep_kept, sleep_rejected = self._record_sleep(request, host_event, sleep_items)
             self.store.set_event_status(subject_id, host_event, "complete")
-        if sleep_kept and self.health_sync.wants(subject_id):
+        if any(self.health_sync.wants(k["subject_id"]) for k in sleep_kept):
             try:
                 self.health_sync.flush(self.store)
             except Exception:  # delivery is best-effort; rows stay queued
@@ -247,13 +250,19 @@ class UserStateService:
         totals for the health plugin. Runs inside the caller's transaction."""
         if not items:
             return [], []
-        subject_id = request.subject_id
-        activity = self.store.get_activity_times(subject_id, request.observed_at - sleep_episodes.MAX_LOOKBACK)
+        activity = self.store.get_activity_times(request.subject_id, request.observed_at - sleep_episodes.MAX_LOOKBACK)
         kept, rejected, touched = [], [], set()
         for i, raw in enumerate(items[:5]):
-            ep, why = sleep_episodes.validate_episode(
-                raw, subject_id=subject_id, event_id=event_id, index=i, text=request.text,
-                observed_at=request.observed_at, message_id=request.source.message_id, activity_times=activity)
+            # Whose sleep: the user's own unless the item names a family member the user mentioned.
+            subject_id, why = family.resolve(raw.get("who") if isinstance(raw, dict) else None, request.text,
+                                             self.family, request.subject_id)
+            ep = None
+            if subject_id is not None:
+                own = subject_id == request.subject_id
+                ep, why = sleep_episodes.validate_episode(
+                    raw, subject_id=subject_id, event_id=event_id, index=i, text=request.text,
+                    observed_at=request.observed_at, message_id=request.source.message_id,
+                    activity_times=activity if own else None, infer=own)
             if ep is None:
                 rejected.append(why)
                 continue
@@ -266,15 +275,15 @@ class UserStateService:
                     continue
                 if sleep_episodes.replaces(ep, old):
                     self.store.supersede_sleep_episode(old.episode_id, ep.episode_id)
-                    touched.add(old.wake_date)
+                    touched.add((subject_id, old.wake_date))
                 else:
                     self.store.supersede_sleep_episode(ep.episode_id, old.episode_id)
                     ep.status, ep.superseded_by = sleep_episodes.SUPERSEDED, old.episode_id
                     break
-            touched.add(ep.wake_date)
+            touched.add((subject_id, ep.wake_date))
             kept.append(ep.to_dict())
-        if self.health_sync.wants(subject_id):
-            for wake_date in touched:
+        for subject_id, wake_date in touched:
+            if self.health_sync.wants(subject_id):
                 body = sleep_episodes.daily_payload(
                     subject_id, wake_date, self.store.get_sleep_episodes(subject_id, wake_date, status="active"))
                 if body is not None:
