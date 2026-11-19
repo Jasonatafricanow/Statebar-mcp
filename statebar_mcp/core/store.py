@@ -147,6 +147,26 @@ CREATE TABLE IF NOT EXISTS sleep_episodes (
 );
 CREATE INDEX IF NOT EXISTS idx_sleep_episodes_day ON sleep_episodes (subject_id, wake_date);
 
+-- Doses taken and workouts done, as reported and checked (core/reports.py), with their one-way
+-- delivery state to the health plugin. Never deleted.
+CREATE TABLE IF NOT EXISTS life_reports (
+    report_id          TEXT PRIMARY KEY,
+    subject_id         TEXT NOT NULL,
+    kind               TEXT NOT NULL,
+    event_id           TEXT NOT NULL,
+    idx                INTEGER NOT NULL,
+    at                 TEXT NOT NULL,
+    payload_json       TEXT NOT NULL,
+    source_text        TEXT NOT NULL DEFAULT '',
+    source_message_id  TEXT NOT NULL DEFAULT '',
+    sync_status        TEXT NOT NULL DEFAULT 'pending',
+    attempts           INTEGER NOT NULL DEFAULT 0,
+    last_error         TEXT NOT NULL DEFAULT '',
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_life_reports_subject ON life_reports (subject_id, kind, at);
+
 -- One-way outbox to the health plugin: the latest daily total per wake date.
 CREATE TABLE IF NOT EXISTS sleep_sync (
     subject_id       TEXT NOT NULL,
@@ -620,6 +640,39 @@ class SQLiteStore:
             self._conn.execute(
                 "UPDATE sleep_episodes SET status='superseded', superseded_by=?, updated_at=? WHERE episode_id=?",
                 (by, _iso(utc_now()), episode_id))
+            self._commit_if_needed()
+
+    def insert_report(self, report) -> bool:
+        """Keep a checked dose/workout report; a replayed event is a no-op (False)."""
+        now = _iso(utc_now())
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT OR IGNORE INTO life_reports (report_id, subject_id, kind, event_id, idx, at, payload_json, "
+                "source_text, source_message_id, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (report.report_id, report.subject_id, report.kind, report.event_id, report.index, _iso(report.at),
+                 json.dumps(report.payload, ensure_ascii=False, sort_keys=True), report.source_text[:2000],
+                 report.source_message_id, now, now))
+            self._commit_if_needed()
+            return cur.rowcount == 1
+
+    def get_reports(self, subject_id: str = "", kind: str = "", pending_only: bool = False, limit: int = 100) -> List[Dict[str, Any]]:
+        sql, args = "SELECT * FROM life_reports WHERE 1=1", []
+        if subject_id:
+            sql += " AND subject_id=?"; args.append(subject_id)
+        if kind:
+            sql += " AND kind=?"; args.append(kind)
+        if pending_only:
+            sql += " AND sync_status='pending'"
+        sql += " ORDER BY at DESC LIMIT ?"; args.append(limit)
+        with self._lock:
+            rows = self._conn.execute(sql, args).fetchall()
+        return [dict(r, payload=json.loads(r["payload_json"])) for r in rows]
+
+    def mark_report_sync(self, report_id: str, ok: bool, error: str = "") -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE life_reports SET sync_status=?, attempts=attempts+1, last_error=?, updated_at=? WHERE report_id=?",
+                ("sent" if ok else "pending", error[:300], _iso(utc_now()), report_id))
             self._commit_if_needed()
 
     def queue_sleep_sync(self, subject_id: str, wake_date: str, payload: Dict[str, Any]) -> bool:

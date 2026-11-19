@@ -64,6 +64,41 @@ class HealthSync:
     def member_of(self, subject_id: str) -> str:
         return self.member_id if subject_id == self.subject_id else self.members.get(subject_id, "")
 
+    def report_url(self, kind: str) -> str:
+        """Doses and workouts go to the plugin's sibling endpoints of the health webhook."""
+        base = self.url.rsplit("/", 1)[0]
+        return f"{base}/{'dose' if kind == 'dose' else 'workout'}-webhook"
+
+    def flush_reports(self, store, limit: int = 20) -> Dict[str, Any]:
+        """Deliver pending dose/workout reports (best-effort; failures stay pending)."""
+        if not self.configured:
+            return {"configured": False}
+        sent = failed = 0
+        rows = [r for s in [self.subject_id, *self.members] for r in store.get_reports(s, pending_only=True, limit=limit)]
+        for row in rows:
+            if row["attempts"] >= MAX_ATTEMPTS:
+                continue
+            p = row["payload"]
+            body = {"sourceEventId": "statebar:" + row["report_id"], "source": "statebar"}
+            if row["kind"] == "dose":
+                body.update(medication=p["medication"], takenAt=row["at"], amount=p.get("amount"))
+            else:
+                body.update(activity=p["activity"], date=p["date"], durationMin=p.get("duration_min"))
+            member = self.member_of(row["subject_id"])
+            if member:
+                body["memberId"] = member
+            try:
+                result = self._post(self.report_url(row["kind"]), self.token, body)
+                if not result.get("ok", False):
+                    raise RuntimeError(str(result.get("error") or result)[:300])
+                store.mark_report_sync(row["report_id"], True)
+                sent += 1
+            except Exception as exc:
+                store.mark_report_sync(row["report_id"], False, str(exc))
+                logger.warning("report sync %s failed: %s", row["report_id"], exc)
+                failed += 1
+        return {"configured": True, "sent": sent, "failed": failed}
+
     def flush(self, store, limit: int = 10) -> Dict[str, Any]:
         """Deliver queued days (best-effort; failures stay queued for the next flush)."""
         if not self.configured:

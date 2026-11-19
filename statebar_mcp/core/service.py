@@ -36,6 +36,7 @@ from .extractor.fast_overlay import FastOverlayExtractor
 from .extractor.persistent import PersistentExtractor
 from .extractor import validator
 from . import sleep_episodes
+from . import reports
 from .health_sync import HealthSync
 from . import family
 from .lifecycle import lazy_expire
@@ -204,7 +205,9 @@ class UserStateService:
         payload = request.observations if isinstance(request.observations, list) else []
         # Retrospective sleep reports are their own record (core/sleep_episodes.py).
         sleep_items = [x for x in payload if isinstance(x, dict) and x.get("type") == "sleep_episode"]
-        payload = [x for x in payload if not (isinstance(x, dict) and x.get("type") == "sleep_episode")]
+        # Doses taken and workouts done are their own records too (core/reports.py).
+        report_items = [x for x in payload if isinstance(x, dict) and x.get("type") in reports.KINDS]
+        payload = [x for x in payload if not (isinstance(x, dict) and x.get("type") in ("sleep_episode", *reports.KINDS))]
         observations = validator.validate_observations(
             payload,
             subject_id,
@@ -224,20 +227,28 @@ class UserStateService:
             applied = self._reconcile_all(subject_id, unreconciled, replay_keys)
             self.store.mark_observations_reconciled(subject_id, host_event, unreconciled)
             sleep_kept, sleep_rejected = self._record_sleep(request, host_event, sleep_items)
+            reports_kept, reports_rejected = self._record_reports(request, host_event, report_items)
             self.store.set_event_status(subject_id, host_event, "complete")
         if any(self.health_sync.wants(k["subject_id"]) for k in sleep_kept):
             try:
                 self.health_sync.flush(self.store)
             except Exception:  # delivery is best-effort; rows stay queued
                 logger.exception("health sync flush failed")
+        if any(self.health_sync.wants(k["subject_id"]) for k in reports_kept):
+            try:
+                self.health_sync.flush_reports(self.store)
+            except Exception:
+                logger.exception("report sync flush failed")
         return {
             "status": "accepted" if existing is None else "resumed",
             "subject_id": subject_id,
             "event_id": host_event,
             "host_observations": [o.to_dict() for o in observations],
-            "host_rejected": len(payload) - len(observations) + len(sleep_rejected),
+            "host_rejected": len(payload) - len(observations) + len(sleep_rejected) + len(reports_rejected),
             "sleep_episodes": sleep_kept,
             "sleep_rejected": sleep_rejected,
+            "reports": reports_kept,
+            "reports_rejected": reports_rejected,
             "sync_states_changed": [self._state_out(s) for s in applied],
             "async_scheduled": False,
         }
@@ -288,6 +299,24 @@ class UserStateService:
                     subject_id, wake_date, self.store.get_sleep_episodes(subject_id, wake_date, status="active"))
                 if body is not None:
                     self.store.queue_sleep_sync(subject_id, wake_date, body)
+        return kept, rejected
+
+    def _record_reports(self, request: ObserveRequest, event_id: str, items: List[Dict[str, Any]]):
+        """Doses and workouts: whose (family rules as for sleep), checked against the user's words, kept,
+        and left pending for the health plugin. Runs inside the caller's transaction."""
+        kept, rejected = [], []
+        for i, raw in enumerate(items[:5]):
+            subject_id, why = family.resolve(raw.get("who"), request.text, self.family, request.subject_id)
+            report = None
+            if subject_id is not None:
+                report, why = reports.validate(raw, subject_id=subject_id, event_id=event_id, index=100 + i,
+                                               text=request.text, observed_at=request.observed_at,
+                                               message_id=request.source.message_id)
+            if report is None:
+                rejected.append(why)
+                continue
+            if self.store.insert_report(report):
+                kept.append(report.to_dict())
         return kept, rejected
 
     def import_sleep_history(self, subject_id: str, import_id: str, items: List[Dict[str, Any]]) -> Dict[str, Any]:
