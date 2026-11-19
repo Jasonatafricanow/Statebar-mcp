@@ -162,6 +162,15 @@ class Contract:
             raise ContractError("subject_id is required")
         return self.service.get_sleep(subject_id, since=str(args.get("since") or ""))
 
+    def sleep_import(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        subject_id = str(args.get("subject_id") or "")
+        if not subject_id:
+            raise ContractError("subject_id is required")
+        try:
+            return self.service.import_sleep_history(subject_id, str(args.get("import_id") or ""), args.get("episodes"))
+        except ValueError as exc:
+            raise ContractError(str(exc)) from exc
+
     def health(self, args: Dict[str, Any] = None) -> Dict[str, Any]:
         return self.service.healthcheck()
 

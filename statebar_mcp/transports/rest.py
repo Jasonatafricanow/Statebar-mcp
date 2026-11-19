@@ -250,6 +250,9 @@ class _Handler(BaseHTTPRequestHandler):
             if path == "/v1/observe":
                 body = self._read_json_body()
                 self._send_json(200, self.contract.observe(body))
+            elif path == "/v1/sleep/import":
+                body = self._read_json_body()
+                self._send_json(200, self.contract.sleep_import(body))
             else:
                 self._send_json(404, {"error": f"not found: {path}"})
         except _BodyRejected:

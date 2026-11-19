@@ -281,6 +281,38 @@ class UserStateService:
                     self.store.queue_sleep_sync(subject_id, wake_date, body)
         return kept, rejected
 
+    def import_sleep_history(self, subject_id: str, import_id: str, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Import an already reviewed sleep history (each item names its source: 原话/台账/日记/推理).
+
+        The review happened offline against the original records; statebar keeps each
+        episode with its source reference and local clock, checks only shape and
+        plausibility, never supersedes during an import, and then queues the days whose
+        every sleep has a known length. Idempotent per (import_id, index); a later live
+        report can supersede an imported episode by the usual rules."""
+        if not import_id or not isinstance(items, list) or not items or len(items) > 2000:
+            raise ValueError("import_id and 1..2000 items are required")
+        inserted, rejected, days = 0, [], set()
+        with self.store.transaction():
+            for i, raw in enumerate(items):
+                try:
+                    ep = sleep_episodes.history_episode(raw, subject_id=subject_id, event_id=f"history:{import_id}", index=i)
+                except ValueError as exc:
+                    rejected.append({"index": i, "reason": str(exc)})
+                    continue
+                if self.store.insert_sleep_episode(ep):
+                    inserted += 1
+                    days.add(ep.wake_date)
+            queued = 0
+            if self.health_sync.wants(subject_id):
+                for wake_date in sorted(days):
+                    body = sleep_episodes.daily_payload(
+                        subject_id, wake_date, self.store.get_sleep_episodes(subject_id, wake_date, status="active"))
+                    if body is not None and self.store.queue_sleep_sync(subject_id, wake_date, body):
+                        queued += 1
+        sync = self.health_sync.flush(self.store, limit=1000) if queued else {"configured": self.health_sync.configured}
+        return {"subject_id": subject_id, "import_id": import_id, "inserted": inserted, "rejected": rejected,
+                "days": len(days), "days_queued_for_health": queued, "health_sync": sync}
+
     def get_sleep(self, subject_id: str, since: str = "") -> Dict[str, Any]:
         """Reported sleep episodes (active and superseded), daily totals and sync status."""
         episodes = self.store.get_sleep_episodes(subject_id, since)

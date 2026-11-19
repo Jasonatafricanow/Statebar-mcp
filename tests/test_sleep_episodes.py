@@ -141,3 +141,28 @@ def test_a_same_length_nap_is_not_mistaken_for_last_nights_sleep(svc):
     say(service, "m3", "美美睡了俩小时", at("2026-11-18T16:30"),  # an afternoon nap
         [{"type": "sleep_episode", "duration_min": 120, "wake_date": "2026-11-18"}])
     assert service.get_sleep(SUBJECT)["daily_minutes"] == {"2026-11-18": 240}
+
+
+def test_history_import_keeps_local_clock_and_only_sends_complete_days(svc):
+    service, posted = svc
+    mp = timezone(timedelta(hours=2))
+    items = [
+        {"wake_date": "2026-08-09", "start": datetime(2026, 8, 9, 12, 30, tzinfo=mp).isoformat(),
+         "end": datetime(2026, 8, 9, 17, 50, tzinfo=mp).isoformat(), "basis": "原话", "utc_offset_min": 120,
+         "source": "Hermes #104467"},
+        {"wake_date": "2026-04-25", "end": at("2026-04-25T10:30").isoformat(), "basis": "台账", "source": "台账4/25"},
+        {"wake_date": "2026-05-23", "duration_min": 150, "basis": "台账", "source": "台账5/23"},
+        {"wake_date": "2026-05-23", "start": at("2026-05-23T05:00").isoformat(), "end": at("2026-05-23T08:30").isoformat(),
+         "basis": "台账", "source": "台账5/23"},
+        {"wake_date": "2026-05-23", "basis": "梦"},
+    ]
+    r = service.import_sleep_history(SUBJECT, "t1", items)
+    assert r["inserted"] == 4 and len(r["rejected"]) == 1 and r["days_queued_for_health"] == 2
+    sleep = service.get_sleep(SUBJECT)
+    e = next(x for x in sleep["episodes"] if x["wake_date"] == "2026-08-09")
+    assert (e["start_local"], e["end_local"], e["minutes"]) == ("08-09 12:30", "08-09 17:50", 320)
+    # 04-25 has a sleep of unknown length: never sent as a (false) total
+    assert sorted(p["measuredAt"][:10] for p in posted) == ["2026-05-23", "2026-08-09"]
+    assert {p["sleepHours"] for p in posted} == {5.33, 6.0}
+    again = service.import_sleep_history(SUBJECT, "t1", items)
+    assert again["inserted"] == 0 and len(posted) == 2

@@ -135,6 +135,7 @@ class SleepEpisode:
     source_message_id: str = ""
     status: str = ACTIVE
     superseded_by: str = ""
+    offset_min: int = 480  # local clock the user reported in (+8 Beijing, +2 Maputo)
 
     @property
     def episode_id(self) -> str:
@@ -157,13 +158,18 @@ class SleepEpisode:
             "wake_date": self.wake_date,
             "start_at": dt_to_iso(self.start_at) if self.start_at else None,
             "end_at": dt_to_iso(self.end_at) if self.end_at else None,
-            "start_local": _local(self.start_at).strftime("%m-%d %H:%M") if self.start_at else None,
-            "end_local": _local(self.end_at).strftime("%m-%d %H:%M") if self.end_at else None,
+            "start_local": self._clock(self.start_at), "end_local": self._clock(self.end_at),
+            "utc_offset_min": self.offset_min,
             "minutes": self.minutes, "basis": self.basis,
             "start_basis": self.start_basis, "end_basis": self.end_basis, "duration_basis": self.duration_basis,
             "observed_at": dt_to_iso(self.observed_at), "source_text": self.source_text,
             "status": self.status, "superseded_by": self.superseded_by,
         }
+
+    def _clock(self, dt: Optional[datetime]) -> Optional[str]:
+        if dt is None:
+            return None
+        return dt.astimezone(timezone(timedelta(minutes=self.offset_min))).strftime("%m-%d %H:%M")
 
     def rank(self) -> Tuple[int, datetime]:
         return (1 if self.basis == STATED else 0, self.observed_at)
@@ -288,13 +294,18 @@ def validate_episode(raw: Dict[str, Any], *, subject_id: str, event_id: str, ind
 
 def daily_payload(subject_id: str, wake_date: str, episodes: List[SleepEpisode]) -> Optional[Dict[str, Any]]:
     """What the health plugin receives for one day: total sleep of the active episodes
-    that end on that day (night sleep and naps). None when no duration is known."""
-    known = [e for e in episodes if e.status == ACTIVE and e.wake_date == wake_date and e.minutes]
-    if not known:
+    that end on that day (night sleep and naps). None when no duration is known, or when
+    any sleep of that day has an unknown length (an undercount would look like a real total)."""
+    day = [e for e in episodes if e.status == ACTIVE and e.wake_date == wake_date]
+    if not day or any(not e.minutes for e in day):
         return None
+    known = day
     total = sum(e.minutes for e in known)
     ends = [e.end_at for e in known if e.end_at]
-    measured = max(ends) if ends else datetime.fromisoformat(wake_date + "T12:00:00").replace(tzinfo=LOCAL_TZ)
+    noon = datetime.fromisoformat(wake_date + "T12:00:00").replace(tzinfo=LOCAL_TZ)
+    measured = max(ends) if ends else noon
+    if _local(measured).date().isoformat() != wake_date:  # e.g. a Maputo-clock wake late at night
+        measured = noon
     body = {"sleepHours": round(total / 60, 2), "measuredAt": _local(measured).isoformat(timespec="seconds")}
     digest = hashlib.sha1(json.dumps([subject_id, wake_date, body], sort_keys=True).encode()).hexdigest()[:10]
     body["sourceEventId"] = f"statebar-sleep:{wake_date}:{digest}"
@@ -308,3 +319,46 @@ def replaces(new: SleepEpisode, old: SleepEpisode) -> bool:
     if new.end_at is None and old.start_at and old.end_at:
         return False
     return new.rank() >= old.rank()
+
+
+_IMPORT_BASES = {"原话": STATED, "台账": STATED, "日记": STATED, "推理": INFERRED}
+
+
+def history_episode(raw: Dict[str, Any], *, subject_id: str, event_id: str, index: int) -> SleepEpisode:
+    """One reviewed history row -> episode. Shape and plausibility only; the evidence
+    review was done against the original records and is cited in ``source``."""
+    if not isinstance(raw, dict):
+        raise ValueError("not an object")
+    kind = str(raw.get("basis") or "")
+    if kind not in _IMPORT_BASES:
+        raise ValueError("basis must be 原话/台账/日记/推理")
+    try:
+        wd = date.fromisoformat(str(raw.get("wake_date") or ""))
+    except ValueError:
+        raise ValueError("wake_date (YYYY-MM-DD) is required") from None
+    offset = int(raw.get("utc_offset_min", 480))
+    if offset not in (120, 480):
+        raise ValueError("utc_offset_min must be 120 (Maputo) or 480 (Beijing)")
+    start, end = _opt_dt(raw.get("start")), _opt_dt(raw.get("end"))
+    duration = raw.get("duration_min")
+    duration = int(duration) if duration not in (None, "") else None
+    if start and end and not MIN_EPISODE <= end - start <= MAX_EPISODE:
+        raise ValueError("start/end must be 10 minutes to 20 hours apart")
+    if duration is not None and not 10 <= duration <= 20 * 60:
+        raise ValueError("duration_min must be 10..1200")
+    if end is not None and end.astimezone(timezone(timedelta(minutes=offset))).date() != wd:
+        raise ValueError("end is not on wake_date in the reported local clock")
+    basis = _IMPORT_BASES[kind]
+    approx = bool(raw.get("approx"))
+    ep = SleepEpisode(subject_id=subject_id, event_id=event_id, index=index, wake_date=wd.isoformat(),
+                      start_at=start, end_at=end, duration_min=duration,
+                      start_basis=(basis if not approx else INFERRED) if start else None,
+                      end_basis=(basis if not approx else INFERRED) if end else None,
+                      duration_basis=basis if duration is not None else None,
+                      observed_at=end or datetime.fromisoformat(wd.isoformat() + "T12:00:00").replace(
+                          tzinfo=timezone(timedelta(minutes=offset))),
+                      source_text=f"[{kind}] {str(raw.get('note') or '')[:300]}",
+                      source_message_id=str(raw.get("source") or "")[:200], offset_min=offset)
+    if ep.start_at and ep.end_at:
+        ep.duration_min = None  # length comes from the clock times
+    return ep

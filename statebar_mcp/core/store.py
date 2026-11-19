@@ -142,7 +142,8 @@ CREATE TABLE IF NOT EXISTS sleep_episodes (
     status             TEXT NOT NULL DEFAULT 'active',
     superseded_by      TEXT NOT NULL DEFAULT '',
     created_at         TEXT NOT NULL,
-    updated_at         TEXT NOT NULL
+    updated_at         TEXT NOT NULL,
+    offset_min         INTEGER NOT NULL DEFAULT 480
 );
 CREATE INDEX IF NOT EXISTS idx_sleep_episodes_day ON sleep_episodes (subject_id, wake_date);
 
@@ -196,6 +197,9 @@ class SQLiteStore:
             self._conn.execute(
                 "ALTER TABLE observations ADD COLUMN time_expression TEXT NOT NULL DEFAULT ''"
             )
+        sleep_cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(sleep_episodes)")}
+        if "offset_min" not in sleep_cols:
+            self._conn.execute("ALTER TABLE sleep_episodes ADD COLUMN offset_min INTEGER NOT NULL DEFAULT 480")
         state_cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(states)")}
         if "last_observation_key" not in state_cols:
             self._conn.execute(
@@ -584,12 +588,12 @@ class SQLiteStore:
             cur = self._conn.execute(
                 "INSERT OR IGNORE INTO sleep_episodes (episode_id, subject_id, event_id, idx, wake_date, "
                 "start_at, end_at, duration_min, start_basis, end_basis, duration_basis, observed_at, "
-                "source_text, source_message_id, status, superseded_by, created_at, updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "source_text, source_message_id, status, superseded_by, created_at, updated_at, offset_min) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (ep.episode_id, ep.subject_id, ep.event_id, ep.index, ep.wake_date, opt(ep.start_at),
                  opt(ep.end_at), ep.duration_min, ep.start_basis, ep.end_basis, ep.duration_basis,
                  _iso(ep.observed_at), ep.source_text, ep.source_message_id, ep.status, ep.superseded_by,
-                 now, now))
+                 now, now, ep.offset_min))
             self._commit_if_needed()
             return cur.rowcount == 1
 
@@ -608,6 +612,7 @@ class SQLiteStore:
             start_basis=r["start_basis"], end_basis=r["end_basis"], duration_basis=r["duration_basis"],
             observed_at=parse_dt(r["observed_at"]), source_text=r["source_text"],
             source_message_id=r["source_message_id"], status=r["status"], superseded_by=r["superseded_by"],
+            offset_min=r["offset_min"],
         ) for r in rows]
 
     def supersede_sleep_episode(self, episode_id: str, by: str) -> None:
