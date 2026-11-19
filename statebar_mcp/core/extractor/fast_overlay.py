@@ -70,7 +70,7 @@ _AWAKE_PATTERNS = [
     # _SLEEP_WAKE_WORDS used to list 醒了 but was never applied, so a lone
     # 「醒了」 produced no sleep observation and only presence/interaction.
     re.compile(
-        rf"{_LEFT}(?:我)?(?:已经|都)?(?:醒了|醒过来){_RIGHT}"
+        rf"(?:{_LEFT}|(?<![说讲问没不])(?=我))(?:我)?(?:已经|都)?(?:醒了|醒过来){_RIGHT}"
     ),
 ]
 

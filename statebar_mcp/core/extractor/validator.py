@@ -100,7 +100,8 @@ _AWAKE_ASSERTION_PATTERNS = [
         rf"{_RIGHT}"
     ),
     re.compile(
-        rf"{_LEFT}(?:我)?(?:已经|都)?(?:醒了|醒过来)"
+        # an explicit 我 needs no left boundary: 老婆我醒了 / 宝宝我醒了
+        rf"(?:{_LEFT}|(?<![说讲问没不])(?=我))(?:我)?(?:已经|都)?(?:醒了|醒过来)"
         rf"{_RIGHT}"
     ),
     re.compile(

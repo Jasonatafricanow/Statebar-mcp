@@ -6,6 +6,7 @@ Stdlib-only HTTP server exposing the frozen Contract:
     GET  /v1/snapshot            ?subject_id=&query=
     GET  /v1/context-candidates  ?subject_id=
     GET  /v1/state               ?subject_id=&category=&key=
+    GET  /v1/sleep               ?subject_id=&since=YYYY-MM-DD  (reported sleep episodes)
     GET  /v1/health
 
 Security (fail-closed):
@@ -224,6 +225,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json(200, self.contract.context_candidates(params))
             elif path == "/v1/state":
                 self._send_json(200, self.contract.get_state(params))
+            elif path == "/v1/sleep":
+                self._send_json(200, self.contract.sleep(params))
             else:
                 self._send_json(404, {"error": f"not found: {path}"})
         except ContractError as exc:

@@ -29,11 +29,14 @@ from __future__ import annotations
 import logging
 import queue
 import threading
-from typing import Dict, List, Optional
+from datetime import date, timedelta
+from typing import Any, Dict, List, Optional
 
 from .extractor.fast_overlay import FastOverlayExtractor
 from .extractor.persistent import PersistentExtractor
 from .extractor import validator
+from . import sleep_episodes
+from .health_sync import HealthSync
 from .lifecycle import lazy_expire
 from .models import (
     Certainty,
@@ -68,8 +71,10 @@ class UserStateService:
         fast_extractor: Optional[FastOverlayExtractor] = None,
         persistent_extractor: Optional[PersistentExtractor] = None,
         now_fn=utc_now,
+        health_sync: Optional[HealthSync] = None,
     ):
         self.store = store
+        self.health_sync = health_sync or HealthSync.from_env()
         self.fast_extractor = fast_extractor or FastOverlayExtractor()
         self.persistent_extractor = persistent_extractor or PersistentExtractor()
         self._now_fn = now_fn
@@ -194,6 +199,9 @@ class UserStateService:
         if existing is None:
             self.store.try_ingest_event(subject_id, host_event, request.observed_at)
         payload = request.observations if isinstance(request.observations, list) else []
+        # Retrospective sleep reports are their own record (core/sleep_episodes.py).
+        sleep_items = [x for x in payload if isinstance(x, dict) and x.get("type") == "sleep_episode"]
+        payload = [x for x in payload if not (isinstance(x, dict) and x.get("type") == "sleep_episode")]
         observations = validator.validate_observations(
             payload,
             subject_id,
@@ -212,15 +220,82 @@ class UserStateService:
                 o.is_replay = True
             applied = self._reconcile_all(subject_id, unreconciled, replay_keys)
             self.store.mark_observations_reconciled(subject_id, host_event, unreconciled)
+            sleep_kept, sleep_rejected = self._record_sleep(request, host_event, sleep_items)
             self.store.set_event_status(subject_id, host_event, "complete")
+        if sleep_kept and self.health_sync.wants(subject_id):
+            try:
+                self.health_sync.flush(self.store)
+            except Exception:  # delivery is best-effort; rows stay queued
+                logger.exception("health sync flush failed")
         return {
             "status": "accepted" if existing is None else "resumed",
             "subject_id": subject_id,
             "event_id": host_event,
             "host_observations": [o.to_dict() for o in observations],
-            "host_rejected": len(payload) - len(observations),
+            "host_rejected": len(payload) - len(observations) + len(sleep_rejected),
+            "sleep_episodes": sleep_kept,
+            "sleep_rejected": sleep_rejected,
             "sync_states_changed": [self._state_out(s) for s in applied],
             "async_scheduled": False,
+        }
+
+    # -- retrospective sleep ----------------------------------------------------
+
+    def _record_sleep(self, request: ObserveRequest, event_id: str, items: List[Dict[str, Any]]):
+        """Validate reported sleep episodes against the user's words, supersede overlapping
+        older reports (stated beats inferred, then the later message), queue the daily
+        totals for the health plugin. Runs inside the caller's transaction."""
+        if not items:
+            return [], []
+        subject_id = request.subject_id
+        activity = self.store.get_activity_times(subject_id, request.observed_at - sleep_episodes.MAX_LOOKBACK)
+        kept, rejected, touched = [], [], set()
+        for i, raw in enumerate(items[:5]):
+            ep, why = sleep_episodes.validate_episode(
+                raw, subject_id=subject_id, event_id=event_id, index=i, text=request.text,
+                observed_at=request.observed_at, message_id=request.source.message_id, activity_times=activity)
+            if ep is None:
+                rejected.append(why)
+                continue
+            if not self.store.insert_sleep_episode(ep):
+                continue  # same event replayed
+            day = date.fromisoformat(ep.wake_date)
+            near = self.store.get_sleep_episodes(subject_id, (day - timedelta(days=1)).isoformat(), status="active")
+            for old in near:
+                if old.episode_id == ep.episode_id or not ep.overlaps(old):
+                    continue
+                if sleep_episodes.replaces(ep, old):
+                    self.store.supersede_sleep_episode(old.episode_id, ep.episode_id)
+                    touched.add(old.wake_date)
+                else:
+                    self.store.supersede_sleep_episode(ep.episode_id, old.episode_id)
+                    ep.status, ep.superseded_by = sleep_episodes.SUPERSEDED, old.episode_id
+                    break
+            touched.add(ep.wake_date)
+            kept.append(ep.to_dict())
+        if self.health_sync.wants(subject_id):
+            for wake_date in touched:
+                body = sleep_episodes.daily_payload(
+                    subject_id, wake_date, self.store.get_sleep_episodes(subject_id, wake_date, status="active"))
+                if body is not None:
+                    self.store.queue_sleep_sync(subject_id, wake_date, body)
+        return kept, rejected
+
+    def get_sleep(self, subject_id: str, since: str = "") -> Dict[str, Any]:
+        """Reported sleep episodes (active and superseded), daily totals and sync status."""
+        episodes = self.store.get_sleep_episodes(subject_id, since)
+        days = {}
+        for ep in episodes:
+            if ep.status == sleep_episodes.ACTIVE and ep.minutes:
+                days[ep.wake_date] = days.get(ep.wake_date, 0) + ep.minutes
+        return {
+            "subject_id": subject_id,
+            "episodes": [e.to_dict() for e in episodes],
+            "daily_minutes": days,
+            "health_sync": {"configured": self.health_sync.configured,
+                            "subject_id": self.health_sync.subject_id,
+                            "rows": [{k: r[k] for k in ("wake_date", "status", "attempts", "last_error", "payload")}
+                                     for r in self.store.get_sleep_sync(subject_id)]},
         }
 
     # -- worker (single thread, bounded lifecycle) -----------------------------

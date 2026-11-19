@@ -22,6 +22,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .sleep_episodes import SleepEpisode
 from .models import (
     Observation,
     Source,
@@ -119,6 +120,42 @@ CREATE TABLE IF NOT EXISTS observation_applications (
     event_id           TEXT NOT NULL,
     observation_index  INTEGER NOT NULL,
     PRIMARY KEY (subject_id, event_id, observation_index)
+);
+
+-- Retrospective sleep episodes the user reported (see core/sleep_episodes.py).
+-- Never deleted: a corrected report marks the older one superseded.
+CREATE TABLE IF NOT EXISTS sleep_episodes (
+    episode_id         TEXT PRIMARY KEY,
+    subject_id         TEXT NOT NULL,
+    event_id           TEXT NOT NULL,
+    idx                INTEGER NOT NULL,
+    wake_date          TEXT NOT NULL,
+    start_at           TEXT,
+    end_at             TEXT,
+    duration_min       INTEGER,
+    start_basis        TEXT,
+    end_basis          TEXT,
+    duration_basis     TEXT,
+    observed_at        TEXT NOT NULL,
+    source_text        TEXT NOT NULL DEFAULT '',
+    source_message_id  TEXT NOT NULL DEFAULT '',
+    status             TEXT NOT NULL DEFAULT 'active',
+    superseded_by      TEXT NOT NULL DEFAULT '',
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sleep_episodes_day ON sleep_episodes (subject_id, wake_date);
+
+-- One-way outbox to the health plugin: the latest daily total per wake date.
+CREATE TABLE IF NOT EXISTS sleep_sync (
+    subject_id       TEXT NOT NULL,
+    wake_date        TEXT NOT NULL,
+    payload_json     TEXT NOT NULL,
+    status           TEXT NOT NULL DEFAULT 'pending',
+    attempts         INTEGER NOT NULL DEFAULT 0,
+    last_error       TEXT NOT NULL DEFAULT '',
+    updated_at       TEXT NOT NULL,
+    PRIMARY KEY (subject_id, wake_date)
 );
 """
 
@@ -536,6 +573,84 @@ class SQLiteStore:
             for table in ("ingested_events", "observations", "states", "state_transitions"):
                 out[table] = self._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         return out
+
+    # -- sleep episodes ---------------------------------------------------------
+
+    def insert_sleep_episode(self, ep: SleepEpisode) -> bool:
+        """Insert once per (event, index); returns False when it already exists."""
+        now = _iso(utc_now())
+        opt = lambda dt: _iso(dt) if dt else None  # noqa: E731
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT OR IGNORE INTO sleep_episodes (episode_id, subject_id, event_id, idx, wake_date, "
+                "start_at, end_at, duration_min, start_basis, end_basis, duration_basis, observed_at, "
+                "source_text, source_message_id, status, superseded_by, created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (ep.episode_id, ep.subject_id, ep.event_id, ep.index, ep.wake_date, opt(ep.start_at),
+                 opt(ep.end_at), ep.duration_min, ep.start_basis, ep.end_basis, ep.duration_basis,
+                 _iso(ep.observed_at), ep.source_text, ep.source_message_id, ep.status, ep.superseded_by,
+                 now, now))
+            self._commit_if_needed()
+            return cur.rowcount == 1
+
+    def get_sleep_episodes(self, subject_id: str, since_date: str = "", status: str = "") -> List[SleepEpisode]:
+        sql = "SELECT * FROM sleep_episodes WHERE subject_id=? AND wake_date >= ?"
+        args: List[Any] = [subject_id, since_date or ""]
+        if status:
+            sql += " AND status=?"
+            args.append(status)
+        with self._lock:
+            rows = self._conn.execute(sql + " ORDER BY wake_date, COALESCE(end_at, ''), observed_at", args).fetchall()
+        opt = lambda v: parse_dt(v) if v else None  # noqa: E731
+        return [SleepEpisode(
+            subject_id=r["subject_id"], event_id=r["event_id"], index=r["idx"], wake_date=r["wake_date"],
+            start_at=opt(r["start_at"]), end_at=opt(r["end_at"]), duration_min=r["duration_min"],
+            start_basis=r["start_basis"], end_basis=r["end_basis"], duration_basis=r["duration_basis"],
+            observed_at=parse_dt(r["observed_at"]), source_text=r["source_text"],
+            source_message_id=r["source_message_id"], status=r["status"], superseded_by=r["superseded_by"],
+        ) for r in rows]
+
+    def supersede_sleep_episode(self, episode_id: str, by: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE sleep_episodes SET status='superseded', superseded_by=?, updated_at=? WHERE episode_id=?",
+                (by, _iso(utc_now()), episode_id))
+            self._commit_if_needed()
+
+    def queue_sleep_sync(self, subject_id: str, wake_date: str, payload: Dict[str, Any]) -> bool:
+        """Queue the day's total; a payload identical to what is already queued/sent is a no-op."""
+        body = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        with self._lock:
+            row = self._conn.execute("SELECT payload_json FROM sleep_sync WHERE subject_id=? AND wake_date=?",
+                                     (subject_id, wake_date)).fetchone()
+            if row and row["payload_json"] == body:
+                return False
+            self._conn.execute(
+                "INSERT INTO sleep_sync (subject_id, wake_date, payload_json, status, attempts, last_error, updated_at) "
+                "VALUES (?,?,?,'pending',0,'',?) ON CONFLICT(subject_id, wake_date) DO UPDATE SET "
+                "payload_json=excluded.payload_json, status='pending', attempts=0, last_error='', updated_at=excluded.updated_at",
+                (subject_id, wake_date, body, _iso(utc_now())))
+            self._commit_if_needed()
+            return True
+
+    def get_sleep_sync(self, subject_id: str = "", pending_only: bool = False, limit: int = 50) -> List[Dict[str, Any]]:
+        sql, args = "SELECT * FROM sleep_sync WHERE 1=1", []
+        if subject_id:
+            sql += " AND subject_id=?"
+            args.append(subject_id)
+        if pending_only:
+            sql += " AND status!='sent'"
+        with self._lock:
+            rows = self._conn.execute(sql + " ORDER BY wake_date LIMIT ?", args + [limit]).fetchall()
+        return [{**dict(r), "payload": json.loads(r["payload_json"])} for r in rows]
+
+    def mark_sleep_sync(self, subject_id: str, wake_date: str, payload_json: str, ok: bool, error: str = "") -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE sleep_sync SET status=?, attempts=attempts+1, last_error=?, updated_at=? "
+                "WHERE subject_id=? AND wake_date=? AND payload_json=?",
+                ("sent" if ok else "failed", error[:300], _iso(utc_now()), subject_id, wake_date, payload_json))
+            self._commit_if_needed()
 
     def dump_json(self) -> str:
         with self._lock:

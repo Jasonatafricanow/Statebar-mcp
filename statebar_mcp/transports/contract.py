@@ -156,6 +156,12 @@ class Contract:
         )
         return {"subject_id": subject_id, "states": states}
 
+    def sleep(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        subject_id = str(args.get("subject_id") or "")
+        if not subject_id:
+            raise ContractError("subject_id is required")
+        return self.service.get_sleep(subject_id, since=str(args.get("since") or ""))
+
     def health(self, args: Dict[str, Any] = None) -> Dict[str, Any]:
         return self.service.healthcheck()
 
@@ -168,6 +174,7 @@ class Contract:
             "user_state.context_candidates": self.context_candidates,
             "user_state.get_state": self.get_state,
             "user_state.health": self.health,
+            "user_state.sleep": self.sleep,
         }.get(tool_name)
         if handler is None:
             raise ContractError(f"unknown tool: {tool_name}")
