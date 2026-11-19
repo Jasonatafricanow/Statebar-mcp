@@ -178,6 +178,28 @@ CREATE TABLE IF NOT EXISTS sleep_sync (
     updated_at       TEXT NOT NULL,
     PRIMARY KEY (subject_id, wake_date)
 );
+
+-- Manual corrections of sleep episodes (supersede / restore), append-only: who, when,
+-- why, and the status before and after. Rows are never updated or deleted.
+CREATE TABLE IF NOT EXISTS sleep_audit (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    subject_id            TEXT NOT NULL,
+    episode_id            TEXT NOT NULL,
+    wake_date             TEXT NOT NULL,
+    action                TEXT NOT NULL,
+    actor                 TEXT NOT NULL DEFAULT '',
+    reason                TEXT NOT NULL DEFAULT '',
+    before_status         TEXT NOT NULL,
+    before_superseded_by  TEXT NOT NULL DEFAULT '',
+    after_status          TEXT NOT NULL,
+    after_superseded_by   TEXT NOT NULL DEFAULT '',
+    at                    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sleep_audit_subject ON sleep_audit (subject_id, wake_date);
+CREATE TRIGGER IF NOT EXISTS sleep_audit_no_update BEFORE UPDATE ON sleep_audit
+BEGIN SELECT RAISE(ABORT, 'sleep_audit is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS sleep_audit_no_delete BEFORE DELETE ON sleep_audit
+BEGIN SELECT RAISE(ABORT, 'sleep_audit is append-only'); END;
 """
 
 
@@ -625,6 +647,16 @@ class SQLiteStore:
             args.append(status)
         with self._lock:
             rows = self._conn.execute(sql + " ORDER BY wake_date, COALESCE(end_at, ''), observed_at", args).fetchall()
+        return self._episodes_from_rows(rows)
+
+    def get_sleep_episode(self, episode_id: str) -> Optional[SleepEpisode]:
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM sleep_episodes WHERE episode_id=?", (episode_id,)).fetchall()
+        found = self._episodes_from_rows(rows)
+        return found[0] if found else None
+
+    @staticmethod
+    def _episodes_from_rows(rows) -> List[SleepEpisode]:
         opt = lambda v: parse_dt(v) if v else None  # noqa: E731
         return [SleepEpisode(
             subject_id=r["subject_id"], event_id=r["event_id"], index=r["idx"], wake_date=r["wake_date"],
@@ -641,6 +673,33 @@ class SQLiteStore:
                 "UPDATE sleep_episodes SET status='superseded', superseded_by=?, updated_at=? WHERE episode_id=?",
                 (by, _iso(utc_now()), episode_id))
             self._commit_if_needed()
+
+    def restore_sleep_episode(self, episode_id: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE sleep_episodes SET status='active', superseded_by='', updated_at=? WHERE episode_id=?",
+                (_iso(utc_now()), episode_id))
+            self._commit_if_needed()
+
+    def insert_sleep_audit(self, entry: Dict[str, Any]) -> int:
+        cols = ("subject_id", "episode_id", "wake_date", "action", "actor", "reason", "before_status",
+                "before_superseded_by", "after_status", "after_superseded_by")
+        with self._lock:
+            cur = self._conn.execute(
+                f"INSERT INTO sleep_audit ({', '.join(cols)}, at) VALUES ({', '.join('?' * len(cols))}, ?)",
+                [str(entry.get(c) or "") for c in cols] + [_iso(utc_now())])
+            self._commit_if_needed()
+            return int(cur.lastrowid)
+
+    def get_sleep_audit(self, subject_id: str, since_date: str = "", episode_id: str = "",
+                        limit: int = 200) -> List[Dict[str, Any]]:
+        sql, args = "SELECT * FROM sleep_audit WHERE subject_id=? AND wake_date >= ?", [subject_id, since_date or ""]
+        if episode_id:
+            sql += " AND episode_id=?"
+            args.append(episode_id)
+        with self._lock:
+            rows = self._conn.execute(sql + " ORDER BY id DESC LIMIT ?", args + [limit]).fetchall()
+        return [dict(r) for r in rows]
 
     def insert_report(self, report) -> bool:
         """Keep a checked dose/workout report; a replayed event is a no-op (False)."""

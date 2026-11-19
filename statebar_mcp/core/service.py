@@ -368,6 +368,70 @@ class UserStateService:
                                      for r in self.store.get_sleep_sync(subject_id)]},
         }
 
+    # -- manual correction (audit console) ---------------------------------------
+
+    def supersede_sleep(self, subject_id: str, episode_id: str, reason: str, actor: str = "") -> Dict[str, Any]:
+        """Mark one episode as wrong (never deleted): superseded_by = ``manual:<reason>``."""
+        reason = (reason or "").strip()
+        if not reason:
+            raise ValueError("reason is required to supersede a sleep episode")
+        return self._correct_sleep(subject_id, episode_id, "supersede", reason[:300], actor)
+
+    def restore_sleep(self, subject_id: str, episode_id: str, reason: str = "", actor: str = "") -> Dict[str, Any]:
+        """Bring a superseded episode back to active (status active, superseded_by cleared)."""
+        return self._correct_sleep(subject_id, episode_id, "restore", (reason or "").strip()[:300], actor)
+
+    def _correct_sleep(self, subject_id: str, episode_id: str, action: str, reason: str, actor: str) -> Dict[str, Any]:
+        ep = self.store.get_sleep_episode(episode_id)
+        if ep is None or ep.subject_id != subject_id:
+            raise ValueError(f"sleep episode not found for {subject_id}: {episode_id}")
+        target = sleep_episodes.SUPERSEDED if action == "supersede" else sleep_episodes.ACTIVE
+        if ep.status == target:  # idempotent: no second audit row, nothing re-queued
+            return {"changed": False, "episode": ep.to_dict(), "audit_id": None,
+                    **self._day_after_correction(subject_id, ep.wake_date, requeue=False)}
+        before = (ep.status, ep.superseded_by)
+        with self.store.transaction():
+            if action == "supersede":
+                self.store.supersede_sleep_episode(episode_id, f"manual:{reason}")
+            else:
+                self.store.restore_sleep_episode(episode_id)
+            after = self.store.get_sleep_episode(episode_id)
+            audit_id = self.store.insert_sleep_audit({
+                "subject_id": subject_id, "episode_id": episode_id, "wake_date": ep.wake_date, "action": action,
+                "actor": (actor or "rest").strip()[:100], "reason": reason,
+                "before_status": before[0], "before_superseded_by": before[1],
+                "after_status": after.status, "after_superseded_by": after.superseded_by})
+            day = self._day_after_correction(subject_id, ep.wake_date, requeue=True)
+        if day["health_queued"]:
+            try:
+                self.health_sync.flush(self.store)
+            except Exception:  # delivery is best-effort; the row stays queued
+                logger.exception("health sync flush failed")
+        out = {"changed": True, "episode": after.to_dict(), "audit_id": audit_id, **day}
+        if action == "restore":
+            # Restoring can bring back a sleep that a later report replaced: both would count.
+            out["overlaps_active"] = [o.episode_id for o in self.store.get_sleep_episodes(
+                subject_id, (date.fromisoformat(ep.wake_date) - timedelta(days=1)).isoformat(), status="active")
+                if o.episode_id != episode_id and after.overlaps(o)]
+        return out
+
+    def _day_after_correction(self, subject_id: str, wake_date: str, requeue: bool) -> Dict[str, Any]:
+        """The corrected day's active total, re-queued for the health plugin. When the day is left
+        with no complete total there is nothing to send (the plugin has no 'clear a day')."""
+        active = self.store.get_sleep_episodes(subject_id, wake_date, status="active")
+        minutes = sum(e.minutes or 0 for e in active if e.wake_date == wake_date)
+        body = sleep_episodes.daily_payload(subject_id, wake_date, active)
+        queued = False
+        if requeue and body is not None and self.health_sync.wants(subject_id):
+            queued = self.store.queue_sleep_sync(subject_id, wake_date, body)
+        note = "" if body is not None else "no complete total for this day; the health plugin keeps its last value"
+        return {"wake_date": wake_date, "daily_minutes": minutes, "health_payload": body,
+                "health_queued": queued, "health_note": note}
+
+    def get_sleep_audit(self, subject_id: str, since: str = "", episode_id: str = "") -> Dict[str, Any]:
+        return {"subject_id": subject_id,
+                "audit": self.store.get_sleep_audit(subject_id, since_date=since, episode_id=episode_id)}
+
     # -- worker (single thread, bounded lifecycle) -----------------------------
 
     def _interaction_observation(self, request: ObserveRequest, index: int) -> Observation:

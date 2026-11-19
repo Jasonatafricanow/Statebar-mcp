@@ -7,6 +7,9 @@ Stdlib-only HTTP server exposing the frozen Contract:
     GET  /v1/context-candidates  ?subject_id=
     GET  /v1/state               ?subject_id=&category=&key=
     GET  /v1/sleep               ?subject_id=&since=YYYY-MM-DD  (reported sleep episodes)
+    GET  /v1/sleep/audit         ?subject_id=&since=&episode_id=  (manual corrections, newest first)
+    POST /v1/sleep/supersede     {"subject_id","episode_id","reason","actor"}  (reason required)
+    POST /v1/sleep/restore       {"subject_id","episode_id","reason","actor"}
     GET  /v1/health
 
 Security (fail-closed):
@@ -227,6 +230,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json(200, self.contract.get_state(params))
             elif path == "/v1/sleep":
                 self._send_json(200, self.contract.sleep(params))
+            elif path == "/v1/sleep/audit":
+                self._send_json(200, self.contract.sleep_audit(params))
             else:
                 self._send_json(404, {"error": f"not found: {path}"})
         except ContractError as exc:
@@ -253,6 +258,12 @@ class _Handler(BaseHTTPRequestHandler):
             elif path == "/v1/sleep/import":
                 body = self._read_json_body()
                 self._send_json(200, self.contract.sleep_import(body))
+            elif path == "/v1/sleep/supersede":
+                body = self._read_json_body()
+                self._send_json(200, self.contract.sleep_supersede(body))
+            elif path == "/v1/sleep/restore":
+                body = self._read_json_body()
+                self._send_json(200, self.contract.sleep_restore(body))
             else:
                 self._send_json(404, {"error": f"not found: {path}"})
         except _BodyRejected:
