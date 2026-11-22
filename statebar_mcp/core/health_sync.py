@@ -65,12 +65,12 @@ class HealthSync:
         return self.member_id if subject_id == self.subject_id else self.members.get(subject_id, "")
 
     def report_url(self, kind: str) -> str:
-        """Doses and workouts go to the plugin's sibling endpoints of the health webhook."""
+        """Doses, workouts and symptoms go to the plugin's sibling endpoints of the health webhook."""
         base = self.url.rsplit("/", 1)[0]
-        return f"{base}/{'dose' if kind == 'dose' else 'workout'}-webhook"
+        return f"{base}/{kind if kind in ('dose', 'symptom') else 'workout'}-webhook"
 
     def flush_reports(self, store, limit: int = 20) -> Dict[str, Any]:
-        """Deliver pending dose/workout reports (best-effort; failures stay pending)."""
+        """Deliver pending dose/workout/symptom reports (best-effort; failures stay pending)."""
         if not self.configured:
             return {"configured": False}
         sent = failed = 0
@@ -82,6 +82,8 @@ class HealthSync:
             body = {"sourceEventId": "statebar:" + row["report_id"], "source": "statebar"}
             if row["kind"] == "dose":
                 body.update(medication=p["medication"], takenAt=row["at"], amount=p.get("amount"))
+            elif row["kind"] == "symptom":
+                body.update(symptom=p["symptom"], key=p["key"], status=p["status"], at=row["at"], episodeId=row["event_id"])
             else:
                 body.update(activity=p["activity"], date=p["date"], durationMin=p.get("duration_min"))
             member = self.member_of(row["subject_id"])

@@ -69,3 +69,15 @@ def test_workout_length_and_day_must_be_said(svc):
             [{"type": "workout", "activity": "跑步", "duration_min": 30},
              {"type": "workout", "activity": "跑步", "date": "2026-11-18"}])
     assert r["reports"] == [] and len(r["reports_rejected"]) == 2
+
+
+def test_symptoms_the_user_said_go_to_the_timeline_once_each(svc):
+    service, posted = svc
+    say(service, "s1", "喉咙疼", at("2026-11-21T09:00"))
+    say(service, "s1", "喉咙疼", at("2026-11-21T09:00"))  # replayed message
+    say(service, "s2", "喉咙不疼了", at("2026-11-21T20:00"))
+    sent = [b for u, b in posted if u.endswith("symptom-webhook")]
+    assert [(b["symptom"], b["status"]) for b in sent] == [("喉咙疼", "active"), ("喉咙疼", "resolved")]
+    assert sent[0]["episodeId"] == sent[1]["episodeId"] and sent[0]["at"].startswith("2026-11-21T01:00")
+    assert "memberId" not in sent[0]  # the plugin's primary user
+    assert len({b["sourceEventId"] for b in sent}) == 2

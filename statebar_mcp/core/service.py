@@ -27,12 +27,13 @@ snapshot stays correct.
 from __future__ import annotations
 
 import logging
+import hashlib
 import queue
 import threading
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
 
-from .extractor.fast_overlay import FastOverlayExtractor
+from .extractor.fast_overlay import SYMPTOM_LEXICON, FastOverlayExtractor
 from .extractor.persistent import PersistentExtractor
 from .extractor import validator
 from . import sleep_episodes
@@ -94,6 +95,7 @@ class UserStateService:
         # Events whose async extraction is queued or in-flight right now.
         self._in_flight: set = set()
         self._in_flight_lock = threading.Lock()
+        self._symptoms_queued = False
 
     # ------------------------------------------------------------------ observe
 
@@ -143,6 +145,7 @@ class UserStateService:
             sync_applied = self._reconcile_all(subject_id, unreconciled, replay_keys)
             self.store.mark_observations_reconciled(subject_id, event_id, unreconciled)
             self.store.set_event_status(subject_id, event_id, "sync_committed")
+        self._flush_symptoms()
 
         result = {
             "status": "accepted" if not resuming else "resumed",
@@ -234,7 +237,7 @@ class UserStateService:
                 self.health_sync.flush(self.store)
             except Exception:  # delivery is best-effort; rows stay queued
                 logger.exception("health sync flush failed")
-        if any(self.health_sync.wants(k["subject_id"]) for k in reports_kept):
+        if any(self.health_sync.wants(k["subject_id"]) for k in reports_kept) or self._take_symptoms_flag():
             try:
                 self.health_sync.flush_reports(self.store)
             except Exception:
@@ -532,6 +535,7 @@ class UserStateService:
                 self._reconcile_all(subject_id, unreconciled, replay_keys)
                 self.store.mark_observations_reconciled(subject_id, event_id, unreconciled)
                 self.store.set_event_status(subject_id, event_id, "complete")
+            self._flush_symptoms()
         except Exception:  # D3: async failure never breaks the sync path
             logger.exception("persistent extraction failed for event %s", event_id)
             try:
@@ -550,8 +554,46 @@ class UserStateService:
         for obs in sorted(observations, key=lambda o: (o.observed_at, o.observation_index)):
             if (obs.event_id, obs.observation_index) in replay_keys:
                 obs.is_replay = True  # strict conflict rules for leftovers
-            changed.extend(self.reconciler.apply(obs))
+            applied = self.reconciler.apply(obs)
+            for state in applied:
+                self._queue_symptom(state, obs)
+            changed.extend(applied)
         return changed
+
+    # -- symptoms to the health plugin ------------------------------------------
+
+    _SYMPTOM_SENT = (StateStatus.ACTIVE, StateStatus.IMPROVING, StateStatus.RESOLVED)
+
+    def _queue_symptom(self, state: State, obs: Observation) -> None:
+        """A symptom the user said appeared, eased or went away goes one way to the health plugin, which
+        lays it beside the doses on a timeline. Only what the user said (active / improving / resolved);
+        a symptom that merely timed out is not an event. Runs inside the caller's transaction; one row
+        per (state, observation, status), so a replayed observation is not sent twice."""
+        if state.category != "health" or state.status not in self._SYMPTOM_SENT:
+            return
+        if not self.health_sync.wants(state.subject_id):
+            return
+        parts = [p for p, k, _ in SYMPTOM_LEXICON if k == state.key]  # 喉咙 / 嗓子: the word the user used
+        part = next((p for p in parts if p in (obs.raw_payload or "")), parts[0] if parts else "")
+        label = (part + ("不舒服" if "discomfort" in state.key else "疼")) if part else "不舒服"
+        index = int(hashlib.sha256(f"{obs.event_id}:{obs.observation_index}:{state.status}".encode()).hexdigest()[:12], 16)
+        report = reports.Report(state.subject_id, "symptom", state.state_id, index, obs.observed_at,
+                                {"symptom": label, "key": state.key, "status": state.status},
+                                obs.raw_payload or "", obs.source.message_id)
+        if self.store.insert_report(report):
+            self._symptoms_queued = True
+
+    def _take_symptoms_flag(self) -> bool:
+        queued, self._symptoms_queued = self._symptoms_queued, False
+        return queued
+
+    def _flush_symptoms(self) -> None:
+        if not self._take_symptoms_flag():
+            return
+        try:
+            self.health_sync.flush_reports(self.store)
+        except Exception:  # best-effort; rows stay pending for the next flush
+            logger.exception("symptom sync flush failed")
 
     def reconcile(self, observation: Observation) -> List[State]:
         """Exposed for transports that already carry validated Observations.
