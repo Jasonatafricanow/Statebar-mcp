@@ -51,6 +51,11 @@ def load_members(env=os.environ) -> List[Member]:
     return parse_members(json.loads(raw)) if raw else []
 
 
+def mentioned(text: str, members: List[Member]) -> bool:
+    """Whether the user's words name a family member (so a bare "喉咙疼" in them may not be the user's)."""
+    return any(a in (text or "") for m in members for a in m.aliases)
+
+
 def resolve(who, text: str, members: List[Member], self_subject: str) -> Tuple[Optional[str], str]:
     """(subject_id, "") or (None, reason). ``who`` is what the host wrote for the item."""
     name = str(who or "").strip()

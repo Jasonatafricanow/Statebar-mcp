@@ -129,6 +129,12 @@ class UserStateService:
         sync_obs = self.fast_extractor.extract(
             subject_id, event_id, request.text, request.source, request.observed_at
         )
+        # "嘻嘻喉咙疼": the fast rules cannot tell whose body it is, so a message naming a family member
+        # leaves symptoms and medicine to the host's state block, which says ``who``.
+        if sync_obs and family.mentioned(request.text, self.family):
+            sync_obs = [o for o in sync_obs if o.category != "health"]
+            for i, o in enumerate(sync_obs):
+                o.observation_index = i
         # V2 first-class signal: the user's real-time interaction itself is
         # evidence (observed, confidence 1.0), independent of the message's
         # language. Assistant questions never produce it (V2-T4), and diary
@@ -211,6 +217,21 @@ class UserStateService:
         # Doses taken and workouts done are their own records too (core/reports.py).
         report_items = [x for x in payload if isinstance(x, dict) and x.get("type") in reports.KINDS]
         payload = [x for x in payload if not (isinstance(x, dict) and x.get("type") in ("sleep_episode", *reports.KINDS))]
+        # A family member's symptom ("who") is kept on that member's subject, by the same rule as their doses:
+        # the user's words must name them. Only symptoms; other states stay the user's own.
+        family_payload, family_rejected = {}, []
+        own_payload = []
+        for x in payload:
+            who = x.get("who") if isinstance(x, dict) else None
+            if str(who or "").strip() in family.SELF_WORDS:
+                own_payload.append(x)
+                continue
+            member, why = family.resolve(who, request.text, self.family, subject_id)
+            if member is None or str(x.get("category", "")).strip() != "health":
+                family_rejected.append(why or "only a family member's symptom can name who")
+                continue
+            family_payload.setdefault(member, []).append(x)
+        payload = own_payload
         observations = validator.validate_observations(
             payload,
             subject_id,
@@ -220,6 +241,9 @@ class UserStateService:
             start_index=0,
             source_text=request.text,
         )
+        family_obs = {m: validator.validate_observations(items, m, host_event, request.source, request.observed_at,
+                                                         start_index=0, source_text=request.text)
+                      for m, items in family_payload.items()}
         leftovers = self.store.get_unreconciled_observations(subject_id, host_event)
         replay_keys = {(o.event_id, o.observation_index) for o in leftovers}
         with self.store.transaction():
@@ -229,6 +253,16 @@ class UserStateService:
                 o.is_replay = True
             applied = self._reconcile_all(subject_id, unreconciled, replay_keys)
             self.store.mark_observations_reconciled(subject_id, host_event, unreconciled)
+            for member, obs_list in family_obs.items():
+                if self.store.get_event(member, host_event) is None:
+                    self.store.try_ingest_event(member, host_event, request.observed_at)
+                self.store.insert_observations(obs_list)
+                pending = self.store.get_unreconciled_observations(member, host_event)
+                for o in pending:
+                    o.is_replay = True
+                applied += self._reconcile_all(member, pending)
+                self.store.mark_observations_reconciled(member, host_event, pending)
+                self.store.set_event_status(member, host_event, "complete")
             sleep_kept, sleep_rejected = self._record_sleep(request, host_event, sleep_items)
             reports_kept, reports_rejected = self._record_reports(request, host_event, report_items)
             self.store.set_event_status(subject_id, host_event, "complete")
@@ -247,7 +281,10 @@ class UserStateService:
             "subject_id": subject_id,
             "event_id": host_event,
             "host_observations": [o.to_dict() for o in observations],
-            "host_rejected": len(payload) - len(observations) + len(sleep_rejected) + len(reports_rejected),
+            "host_rejected": len(payload) - len(observations) + len(sleep_rejected) + len(reports_rejected)
+            + len(family_rejected) + sum(len(family_payload[m]) - len(family_obs[m]) for m in family_obs),
+            "family_observations": [o.to_dict() for obs_list in family_obs.values() for o in obs_list],
+            "family_rejected": family_rejected,
             "sleep_episodes": sleep_kept,
             "sleep_rejected": sleep_rejected,
             "reports": reports_kept,

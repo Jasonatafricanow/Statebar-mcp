@@ -81,3 +81,24 @@ def test_symptoms_the_user_said_go_to_the_timeline_once_each(svc):
     assert sent[0]["episodeId"] == sent[1]["episodeId"] and sent[0]["at"].startswith("2026-11-21T01:00")
     assert "memberId" not in sent[0]  # the plugin's primary user
     assert len({b["sourceEventId"] for b in sent}) == 2
+
+
+def test_a_family_members_symptom_goes_to_their_timeline_not_the_users(svc):
+    service, posted = svc
+    sym = lambda status: {"type": "symptom", "who": "嘻嘻", "category": "health", "key": "sore_throat",
+                          "value": status, "certainty": "confirmed", "time_expression": "now", "raw_payload": ""}
+    # The fast rules alone must not put 嘻嘻's sore throat on the user.
+    out = say(service, "f1", "嘻嘻喉咙疼", at("2026-11-21T09:00"), [sym("pain")])
+    say(service, "f2", "嘻嘻喉咙不疼了", at("2026-11-21T20:00"),
+        [{**sym("resolved"), "type": "resolve"}])
+    sent = [b for u, b in posted if u.endswith("symptom-webhook")]
+    assert [(b.get("memberId"), b["symptom"], b["status"]) for b in sent] == [("kid", "喉咙疼", "active"),
+                                                                              ("kid", "喉咙疼", "resolved")]
+    assert out["family_observations"][0]["subject_id"] == "kid"
+    # Someone the user did not name, or a non-symptom state for a family member, is not written.
+    out = say(service, "f3", "我喉咙疼", at("2026-11-21T21:00"), [sym("pain")])
+    assert out["family_rejected"] and not out["family_observations"]
+    out = say(service, "f4", "嘻嘻要睡了", at("2026-11-21T21:00"),
+              [{"type": "sleep", "who": "嘻嘻", "category": "sleep", "key": "sleeping", "value": "preparing_sleep",
+                "certainty": "confirmed", "time_expression": "now", "raw_payload": ""}])
+    assert out["family_rejected"]
