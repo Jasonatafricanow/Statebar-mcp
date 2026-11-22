@@ -156,6 +156,44 @@ class Contract:
         )
         return {"subject_id": subject_id, "states": states}
 
+    def sleep(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        subject_id = str(args.get("subject_id") or "")
+        if not subject_id:
+            raise ContractError("subject_id is required")
+        return self.service.get_sleep(subject_id, since=str(args.get("since") or ""))
+
+    def sleep_import(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        subject_id = str(args.get("subject_id") or "")
+        if not subject_id:
+            raise ContractError("subject_id is required")
+        try:
+            return self.service.import_sleep_history(subject_id, str(args.get("import_id") or ""), args.get("episodes"))
+        except ValueError as exc:
+            raise ContractError(str(exc)) from exc
+
+    def _sleep_correction(self, args: Dict[str, Any], fn) -> Dict[str, Any]:
+        subject_id = str(args.get("subject_id") or "")
+        episode_id = str(args.get("episode_id") or "")
+        if not subject_id or not episode_id:
+            raise ContractError("subject_id and episode_id are required")
+        try:
+            return fn(subject_id, episode_id, str(args.get("reason") or ""), actor=str(args.get("actor") or ""))
+        except ValueError as exc:
+            raise ContractError(str(exc)) from exc
+
+    def sleep_supersede(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        return self._sleep_correction(args, self.service.supersede_sleep)
+
+    def sleep_restore(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        return self._sleep_correction(args, self.service.restore_sleep)
+
+    def sleep_audit(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        subject_id = str(args.get("subject_id") or "")
+        if not subject_id:
+            raise ContractError("subject_id is required")
+        return self.service.get_sleep_audit(subject_id, since=str(args.get("since") or ""),
+                                            episode_id=str(args.get("episode_id") or ""))
+
     def health(self, args: Dict[str, Any] = None) -> Dict[str, Any]:
         return self.service.healthcheck()
 
@@ -168,6 +206,7 @@ class Contract:
             "user_state.context_candidates": self.context_candidates,
             "user_state.get_state": self.get_state,
             "user_state.health": self.health,
+            "user_state.sleep": self.sleep,
         }.get(tool_name)
         if handler is None:
             raise ContractError(f"unknown tool: {tool_name}")

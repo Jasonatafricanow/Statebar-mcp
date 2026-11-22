@@ -444,6 +444,8 @@ class Snapshot:
                     "key": i.key,
                     "value": i.value,
                     "status": i.status,
+                    # the state behind the line, so the console can open its history
+                    "state_id": i.source_state_id,
                 }
                 for i in self.items
             ],
